@@ -1,0 +1,271 @@
+"""Human approval gates for high-risk operations.
+
+The default mode is ``client``: the MCP client is asked through an
+elicitation resolver, which works on both legacy and current protocol
+versions. ``local`` uses an operating-system dialog (zenity) and is
+independent of the MCP client. ``none`` exists for disposable test
+keyrings and is recorded in the audit log.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from mcp.server.mcpserver import (
+    AcceptedElicitation,
+    CancelledElicitation,
+    DeclinedElicitation,
+    Elicit,
+    ElicitationResult,
+)
+from pydantic import BaseModel, Field
+
+from .errors import GpgMcpError
+from .policy import audit, get_policy
+
+
+class Confirm(BaseModel):
+    approve: bool = Field(description="Approve this gpg-mcp operation?")
+
+
+class DestructiveConfirm(BaseModel):
+    approve: bool = Field(description="Approve this destructive operation?")
+    confirmation: str = Field(
+        description="Type the last 8 characters of the key fingerprint to confirm"
+    )
+
+
+@dataclass(frozen=True)
+class Decision:
+    approved: bool
+    reason: str
+
+
+def _summary_hash(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def payload_summary(action: str, data: bytes, *, key: str = "", extra: str = "") -> str:
+    preview = ""
+    try:
+        text = data[:200].decode("utf-8")
+        if text.isprintable() and "\x00" not in text:
+            preview = "\nPreview: " + text.replace("\n", "\\n")[:120]
+    except UnicodeDecodeError:
+        pass
+    parts = [
+        f"gpg-mcp wants to {action}.",
+        f"Key: {key}" if key else "",
+        f"Size: {len(data)} bytes",
+        f"SHA-256: {_summary_hash(data)}",
+        extra,
+        preview,
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def _zenity() -> str | None:
+    found = shutil.which("zenity")
+    if not found:
+        return None
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return None
+    return str(Path(found).resolve())
+
+
+async def _zenity_question(summary: str) -> bool:
+    binary = _zenity()
+    if not binary:
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            binary,
+            "--question",
+            "--title",
+            "gpg-mcp approval",
+            "--width",
+            "640",
+            "--text",
+            summary,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            code = await asyncio.wait_for(proc.wait(), timeout=180)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return False
+        return code == 0
+    except OSError:
+        return False
+
+
+async def _zenity_entry(summary: str, prompt: str) -> str | None:
+    binary = _zenity()
+    if not binary:
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            binary,
+            "--entry",
+            "--title",
+            "gpg-mcp destructive confirmation",
+            "--width",
+            "640",
+            "--text",
+            f"{summary}\n\n{prompt}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=180)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return None
+        if proc.returncode != 0:
+            return None
+        return out.decode("utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
+async def request(op: str, summary: str) -> Confirm | Elicit[Confirm]:
+    """Return a decision, or ask the MCP client to decide."""
+    policy = get_policy()
+    if op not in policy.require_approval:
+        return Confirm(approve=True)
+    if policy.approval == "none":
+        audit(policy, {"event": "approval", "tool": op, "decision": "skipped", "summary": summary})
+        return Confirm(approve=True)
+    if policy.approval == "local":
+        approved = await _zenity_question(summary)
+        audit(
+            policy,
+            {
+                "event": "approval",
+                "tool": op,
+                "decision": "local_accept" if approved else "local_decline",
+                "summary": summary,
+            },
+        )
+        return Confirm(approve=approved)
+    return Elicit(summary, Confirm)
+
+
+async def request_destructive(
+    op: str, summary: str, fingerprint: str
+) -> DestructiveConfirm | Elicit[DestructiveConfirm]:
+    policy = get_policy()
+    suffix = fingerprint[-8:].upper()
+    if op not in policy.require_approval:
+        return DestructiveConfirm(approve=True, confirmation=suffix)
+    if policy.approval == "none":
+        audit(
+            policy,
+            {
+                "event": "approval",
+                "tool": op,
+                "decision": "skipped",
+                "destructive": True,
+                "summary": summary,
+            },
+        )
+        return DestructiveConfirm(approve=True, confirmation=suffix)
+    if policy.approval == "local":
+        approved = await _zenity_question(summary)
+        typed = (
+            await _zenity_entry(summary, f"Type the last 8 characters: {suffix}")
+            if approved
+            else None
+        )
+        ok = bool(approved and typed and typed.strip().upper() == suffix)
+        audit(
+            policy,
+            {
+                "event": "approval",
+                "tool": op,
+                "decision": "local_accept" if ok else "local_decline",
+                "destructive": True,
+                "summary": summary,
+            },
+        )
+        return DestructiveConfirm(approve=ok, confirmation=typed or "")
+    return Elicit(
+        f"{summary}\n\nThis is destructive. Type the last 8 characters of the "
+        f"fingerprint ({suffix}) to confirm.",
+        DestructiveConfirm,
+    )
+
+
+def evaluate(result: ElicitationResult[Any] | Confirm | DestructiveConfirm) -> Decision:
+    if isinstance(result, Confirm):
+        return Decision(result.approve, "accepted" if result.approve else "declined")
+    if isinstance(result, DestructiveConfirm):
+        return Decision(result.approve, "accepted" if result.approve else "declined")
+    match result:
+        case AcceptedElicitation(data=Confirm(approve=approved)):
+            return Decision(approved, "accepted" if approved else "declined")
+        case AcceptedElicitation(data=DestructiveConfirm()):
+            return Decision(False, "destructive confirmation required")
+        case DeclinedElicitation():
+            return Decision(False, "declined")
+        case CancelledElicitation():
+            return Decision(False, "cancelled")
+        case _:
+            return Decision(False, "no approval")
+
+
+def evaluate_destructive(
+    result: ElicitationResult[Any] | DestructiveConfirm, fingerprint: str
+) -> Decision:
+    suffix = fingerprint[-8:].upper()
+    if isinstance(result, DestructiveConfirm):
+        if result.approve and result.confirmation.strip().upper() == suffix:
+            return Decision(True, "accepted")
+        if not result.approve:
+            return Decision(False, "declined")
+        return Decision(False, "confirmation text did not match")
+    match result:
+        case AcceptedElicitation(data=DestructiveConfirm(approve=True, confirmation=typed)):
+            if typed.strip().upper() == suffix:
+                return Decision(True, "accepted")
+            return Decision(False, "confirmation text did not match")
+        case AcceptedElicitation(data=DestructiveConfirm(approve=False)):
+            return Decision(False, "declined")
+        case DeclinedElicitation():
+            return Decision(False, "declined")
+        case CancelledElicitation():
+            return Decision(False, "cancelled")
+        case _:
+            return Decision(False, "no approval")
+
+
+def record_decision(op: str, decision: Decision, *, fingerprint: str | None = None, **extra: Any) -> None:
+    audit(
+        get_policy(),
+        {
+            "event": "approval_result",
+            "tool": op,
+            "decision": decision.reason,
+            "approved": decision.approved,
+            "fingerprint": fingerprint,
+            **extra,
+        },
+    )
+
+
+def require_approved(decision: Decision, op: str) -> None:
+    if not decision.approved:
+        raise GpgMcpError(
+            f"{op} was not approved ({decision.reason})",
+            code="approval_denied",
+        )
