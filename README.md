@@ -46,23 +46,46 @@ fixed, typed surface with deliberate omissions:
 3. **Signing and decryption use allow-listed keys.** With a shared `~/.gnupg`, an empty allow-list
    denies both. With a dedicated keyring, the keyring itself is the allow-list boundary.
 4. **Decryption is recipient-checked.** Before decrypting, `gpg --list-packets` is used to confirm
-   the ciphertext is addressed to an allowed key. Hidden-recipient messages are refused by default.
+   the ciphertext is addressed to an allowed key. Hidden recipients are refused by default, even
+   when the same message also has a visible allowed recipient.
 5. **Invalid embedded signatures abort decryption.** If `verify=true` (default) and the decrypted
-   message carries a bad, revoked or expired signature, the plaintext is **not** returned.
-6. **High-risk operations require human approval.** A resolver asks the MCP client; if the client
-   cannot ask, the operation fails closed.
-7. **Destructive operations require typed confirmation.** Deleting or revoking a key requires the
-   operator to type the last 8 characters of the fingerprint.
-8. **Every high-risk operation is audited.** The ledger records fingerprints, payload SHA-256 and
-   the decision — never plaintext or passphrases.
-9. **No shell.** Commands are `execve`-style argv arrays. No shell interpolation, no option
-   injection from user strings.
-10. **Minimal environment.** `LD_*`, `GPG_AGENT_INFO`, `GPG_TTY`, `SSH_AUTH_SOCK` and other
+   message carries a bad, expired or revoked signature, the plaintext is **not** returned.
+   `valid` is the policy result; the cryptographic result is reported separately.
+6. **Authorization is a fail-closed registry.** Every high-risk tool names a registered operation.
+   Unknown operations require approval. Composite operations (`sign_and_encrypt`, and `encrypt`
+   with `sign_with`) inherit the approval requirement of every constituent, so a policy that gates
+   only signing or only encryption cannot be bypassed.
+7. **Revocation certificates are validated before import.** The certificate must contain a
+   revocation signature, must reject secret-key packets, must target exactly the requested
+   fingerprint, and must demonstrably revoke that key in an ephemeral keyring. `apply=false` is a
+   true dry run and never touches the real keyring.
+8. **Destructive operations require typed confirmation.** Deleting, revoking, or applying a
+   revocation certificate requires the operator to type the last 8 characters of the fingerprint.
+9. **Every high-risk operation is audited.** The ledger records operation names, fingerprints,
+   payload SHA-256, size and the decision — never plaintext, payload previews or passphrases.
+10. **No shell.** Commands are `execve`-style argv arrays. No shell interpolation, no option
+    injection from user strings.
+11. **Minimal environment.** `LD_*`, `GPG_AGENT_INFO`, `GPG_TTY`, `SSH_AUTH_SOCK` and other
     variables are not passed to gpg. Only the display/session variables pinentry needs are kept.
-11. **Sanitised binaries and paths.** `gpg`, `gpgconf` and `zenity` are resolved to absolute paths,
-    must be regular files, and must not be group/world writable.
-12. **Bounded resources.** Input/output size caps, per-operation timeouts, a dedicated process
+12. **Sanitised binaries and paths.** `gpg`, `gpgconf` and `zenity` are resolved to absolute paths,
+    must be regular files, and must not be group/world writable. An unsafe `zenity` makes local
+    approval fail closed instead of trusting a substituted dialog.
+13. **Bounded resources.** Input/output size caps, per-operation timeouts, a dedicated process
     group killed on timeout, and a 0700 temporary directory with 0600 files.
+
+### Verification result semantics
+
+`verify` (and the embedded-signature result returned by `decrypt`) separates four ideas:
+
+| Field | Meaning |
+|---|---|
+| `cryptographically_valid` | gpg emitted `VALIDSIG`; the signature math checks out |
+| `policy_acceptable` | additionally a `GOODSIG` with no expired signature, expired key, revoked key or missing public key |
+| `valid` | alias for `policy_acceptable`, retained for compatibility |
+| `identity_trusted` | signer has full or ultimate trust; reported separately, not required for acceptance |
+
+Decryption releases plaintext only when the embedded signature is `policy_acceptable`. A
+mathematically valid but expired or revoked signature is never enough.
 
 ### What it does **not** guarantee
 
@@ -90,7 +113,13 @@ fixed, typed surface with deliberate omissions:
 | Agent imports a secret key | Secret packets detected and rejected |
 | Agent deletes a key | `destructiveHint` + typed fingerprint suffix |
 | Agent revokes a key | `destructiveHint` + typed fingerprint suffix |
-| Agent reads plaintext from a bad signature | Bad/revoked/expired embedded signatures abort |
+| Agent submits a revocation certificate for another key | Certificate validated in an ephemeral keyring and bound to the requested fingerprint |
+| Agent asks for a revocation dry-run to mutate state | `apply=false` validates in an ephemeral keyring only |
+| Agent exploits a custom policy that gates only one composite constituent | Composite operations inherit every constituent's approval requirement |
+| Agent reads a payload from the audit ledger | Approval previews stay in the UI; audit stores only hashes/metadata |
+| Agent hides one recipient among visible ones | Any hidden recipient is rejected unless explicitly enabled |
+| Agent substitutes a fake local approval dialog | `zenity` gets the same trusted-binary checks as gpg |
+| Agent reads plaintext from a bad signature | Bad/expired/revoked embedded signatures are not policy-acceptable and abort |
 | Compression bomb / huge output | Capped streaming reads; process group killed |
 | PATH hijack | Absolute binary paths, ownership/mode checks |
 | Passphrase leak through argv/env/stdin | Pinentry only; no passphrase code path |
@@ -239,8 +268,9 @@ Key management:
 | `import_public_key` | Import public material; secret packets rejected |
 | `delete_key` | Delete public or secret+public; typed confirmation |
 | `set_ownertrust` | `never`/`marginal`/`full`; ultimate is CLI-only |
-| `generate_revocation` | Return the stored revocation certificate |
-| `import_revocation`, `revoke_key` | Apply a revocation; typed confirmation |
+| `generate_revocation` | Validate and return the stored revocation certificate |
+| `import_revocation` | Validate in an ephemeral keyring; `apply=false` is a true dry run |
+| `revoke_key` | Validate and apply the stored certificate; typed confirmation |
 
 Network (opt-in):
 
@@ -266,10 +296,19 @@ Network (opt-in):
 
 ### `client` (default)
 
-The server asks the MCP client to show an approval form. The form includes the operation, key
-fingerprint, payload size, SHA-256 and a short preview. It is implemented as an MCP **resolver**, so
-it works with both legacy and current protocol versions. If the client did not declare elicitation
-support, the call fails closed.
+The server asks the MCP client to show an approval form. The form includes the operation, full key
+fingerprints and identities, payload size, SHA-256 and a short preview. It is implemented as an MCP
+**resolver**, so it works with both legacy and current protocol versions. If the client did not
+declare elicitation support, the call fails closed.
+
+Composite operations require approval if any constituent requires it. `sign_and_encrypt` inherits
+both `sign` and `encrypt`; `encrypt(..., sign_with=...)` inherits `sign` as well. A custom
+`require_approval = ["sign"]` therefore still gates encryption-with-signing, and
+`require_approval = ["encrypt"]` still gates `sign_and_encrypt`.
+
+For revocation imports, the approval form shows the identity derived from the certificate itself,
+not merely the fingerprint passed as an argument. A certificate for a different key is rejected
+before approval is requested.
 
 ### `local`
 
@@ -338,8 +377,12 @@ Every high-risk operation appends one JSON object to `audit.jsonl`:
  "payload_sha256":"...","size":42,"result":"ok"}
 ```
 
-The ledger contains no plaintext, no passphrases and no private key material. It is append-only with
-mode `0600`, but it is not tamper-proof against the same OS user.
+The ledger contains no plaintext, no payload previews, no passphrases and no private key material.
+Approval summaries are rendered for the human but never written to the ledger. The file is
+append-only with mode `0600`. `gpg-mcp` only tightens permissions on an audit directory it creates
+itself; it never `chmod`s an existing arbitrary parent such as `/tmp`.
+
+It is not tamper-proof against the same OS user.
 
 ---
 
@@ -359,10 +402,18 @@ operations. It asserts, among other things, that:
 
 - no response contains `PRIVATE KEY BLOCK`;
 - no command line contains a forbidden option or a passphrase;
-- secret-key imports are rejected;
-- decryption refuses ciphertext addressed to another key;
-- destructive operations require the typed fingerprint suffix;
+- secret-key imports and secret-key revocation imports are rejected;
+- the default policy requires approval and typed confirmation for `import_revocation`, `revoke_key`
+  and `delete_key`;
+- composite operations inherit constituent approval requirements;
+- revocation dry-runs do not modify the real keyring, and certificates for another key are rejected;
+- expired signatures, expired keys, revoked keys and missing public keys are never policy-acceptable;
+- decryption refuses ciphertext addressed to another key and mixed hidden/visible recipients;
+- the audit ledger contains no payload preview and does not change an existing directory's mode;
+- unsafe `zenity`/binary permissions are rejected;
 - option-injection attempts fail validation.
+
+CI runs `ruff` and `pytest` on Python 3.11, 3.12 and 3.13 with GnuPG installed (`.github/workflows/ci.yml`).
 
 ---
 
@@ -371,7 +422,9 @@ operations. It asserts, among other things, that:
 - Text and base64 inputs are capped; large files should be handled out-of-band.
 - Keyserver search output is human-readable text, not a structured list.
 - Revocation uses the certificate generated at key creation time. If it is missing, generate one
-  out-of-band with `gpg --gen-revoke`.
+  out-of-band with `gpg --gen-revoke`. The target key must already be present in the configured
+  keyring; revocation certificates for unknown keys are rejected. `import_revocation` handles full
+  primary-key revocation, not selective subkey or UID revocation.
 - Smartcard key generation and PIN management are intentionally out of scope.
 - `approval = "client"` depends on the client rendering elicitation forms honestly.
 

@@ -16,7 +16,6 @@ import os
 import re
 import shutil
 import signal
-import stat
 import tempfile
 import time
 from collections.abc import Iterable
@@ -26,6 +25,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
+from .binaries import secure_binary
 from .errors import (
     GpgExecutionError,
     GpgMcpError,
@@ -63,26 +63,6 @@ _STATUS_LIMIT = 2 * 1024 * 1024
 # ---------------------------------------------------------------------------
 # binary and environment hygiene
 # ---------------------------------------------------------------------------
-
-def _secure_binary(name: str, *, required: bool = True) -> str | None:
-    found = shutil.which(name)
-    if not found:
-        if required:
-            raise GpgMcpError(f"required binary not found: {name}")
-        return None
-    path = Path(found).resolve()
-    try:
-        st = path.stat()
-    except OSError as exc:
-        raise GpgMcpError(f"cannot stat {path}: {exc}") from exc
-    if not stat.S_ISREG(st.st_mode):
-        raise GpgMcpError(f"{path} is not a regular file")
-    if st.st_mode & 0o022:
-        raise GpgMcpError(f"{path} is group/world writable; refusing to execute it")
-    if st.st_uid not in (0, os.getuid()):
-        raise GpgMcpError(f"{path} is not owned by root or the current user")
-    return str(path)
-
 
 def _base_env(home: Path) -> dict[str, str]:
     env = {
@@ -314,14 +294,25 @@ def parse_colon_keys(text: str) -> list[dict[str, Any]]:
 
 
 def _verification(status: list[StatusEvent]) -> dict[str, Any]:
+    """Classify a signature.
+
+    ``cryptographically_valid`` means the math checked out (VALIDSIG).
+    ``policy_acceptable`` additionally requires a GOODSIG with no expired
+    signature, expired key or revoked key. ``valid`` is kept as the policy
+    result so decryption only releases plaintext under the strict rule.
+    Identity trust is reported separately and is not part of acceptance.
+    """
     out: dict[str, Any] = {
         "valid": False,
+        "cryptographically_valid": False,
+        "policy_acceptable": False,
         "status": "UNKNOWN",
         "signer_fingerprint": None,
         "primary_fingerprint": None,
         "key_id": None,
         "uid": None,
         "trust": None,
+        "identity_trusted": False,
         "hash_algo": None,
         "pubkey_algo": None,
         "sig_class": None,
@@ -336,7 +327,7 @@ def _verification(status: list[StatusEvent]) -> dict[str, Any]:
         kw = ev.keyword
         if kw == "VALIDSIG" and len(ev.args) >= 9:
             out.update(
-                valid=True,
+                cryptographically_valid=True,
                 signer_fingerprint=ev.args[0].upper(),
                 created_at=_iso(ev.args[2]),
                 expires_at=_iso(ev.args[3]),
@@ -351,18 +342,14 @@ def _verification(status: list[StatusEvent]) -> dict[str, Any]:
                 out["key_id"] = ev.args[0].upper()
             if len(ev.args) > 1:
                 out["uid"] = sanitize_text(unquote(" ".join(ev.args[1:])))
-            if kw == "BADSIG":
-                out["valid"] = False
             if kw == "EXPKEYSIG":
                 out["key_expired"] = True
-            if kw == "EXPSIG":
+            elif kw == "EXPSIG":
                 out["sig_expired"] = True
-            if kw == "REVKEYSIG":
+            elif kw == "REVKEYSIG":
                 out["key_revoked"] = True
-                out["valid"] = False
         elif kw == "ERRSIG":
             out["status"] = "ERRSIG"
-            out["valid"] = False
             if ev.args:
                 out["key_id"] = ev.args[0].upper()
         elif kw == "NO_PUBKEY":
@@ -375,6 +362,18 @@ def _verification(status: list[StatusEvent]) -> dict[str, Any]:
             out["sig_expired"] = True
         elif kw == "KEYREVOKED":
             out["key_revoked"] = True
+
+    conditions_clear = not (
+        out["key_expired"]
+        or out["sig_expired"]
+        or out["key_revoked"]
+        or out["missing_key"]
+    )
+    out["policy_acceptable"] = bool(
+        out["cryptographically_valid"] and conditions_clear and out["status"] == "GOODSIG"
+    )
+    out["valid"] = out["policy_acceptable"]
+    out["identity_trusted"] = out["trust"] in {"full", "ultimate"}
     return out
 
 
@@ -403,6 +402,26 @@ def clean_revocation_certificate(text: str) -> str:
     return text
 
 
+_ISSUER_FPR_RE = re.compile(r"issuer fpr v[0-9]+ ([0-9A-Fa-f]{40,64})")
+_REVOCATION_SIG_RE = re.compile(r"sigclass 0x20", re.IGNORECASE)
+_KEYID_RE = re.compile(r"keyid ([0-9A-Fa-f]{16,32})")
+
+
+def revocation_packet_info(packet_text: str) -> dict[str, Any]:
+    keyids = {match.upper() for match in _KEYID_RE.findall(packet_text)}
+    return {
+        "issuer_fingerprints": {
+            match.upper() for match in _ISSUER_FPR_RE.findall(packet_text)
+        },
+        "keyids": keyids,
+        "has_revocation_signature": bool(_REVOCATION_SIG_RE.search(packet_text)),
+        "has_public_key": bool(
+            re.search(r":public (?:sub )?key packet:", packet_text)
+        ),
+        "hidden_keyids": any(set(keyid) == {"0"} for keyid in keyids),
+    }
+
+
 def _import_summary(status: list[StatusEvent]) -> dict[str, Any]:
     imported = [
         ev.args[1].upper()
@@ -427,8 +446,8 @@ class Gpg:
     def __init__(self, policy: Policy) -> None:
         self.policy = policy
         self.home = policy.gnupg_home
-        self.gpg = _secure_binary("gpg")
-        self.gpgconf = _secure_binary("gpgconf", required=False)
+        self.gpg = secure_binary("gpg")
+        self.gpgconf = secure_binary("gpgconf", required=False)
         self.env = _base_env(self.home)
         self._lock = asyncio.Lock()
 
@@ -460,8 +479,11 @@ class Gpg:
         timeout: int | None = None,
         check: bool = True,
         use_status: bool = True,
+        home: Path | None = None,
     ) -> GpgResult:
-        assert_keyring_permissions(self.home)
+        target_home = home or self.home
+        target_env = self.env if home is None else _base_env(target_home)
+        assert_keyring_permissions(target_home)
         async with self._lock:
             tmp = Path(tempfile.mkdtemp(prefix="gpg-mcp-"))
             os.chmod(tmp, 0o700)
@@ -496,7 +518,7 @@ class Gpg:
                     else asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    env=self.env,
+                    env=target_env,
                     start_new_session=True,
                 )
                 stdout_task = asyncio.create_task(
@@ -580,15 +602,21 @@ class Gpg:
         )
 
     async def run_tool(
-        self, binary: str, args: Iterable[str], *, timeout: int = 15
+        self,
+        binary: str,
+        args: Iterable[str],
+        *,
+        timeout: int = 15,
+        home: Path | None = None,
     ) -> tuple[int, bytes, str]:
+        env = self.env if home is None else _base_env(home)
         proc = await asyncio.create_subprocess_exec(
             binary,
             *args,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=self.env,
+            env=env,
             start_new_session=True,
         )
         try:
@@ -951,30 +979,30 @@ class Gpg:
                 "use symmetric_decrypt"
             )
         allowed_keyids, wanted = await self._allowed_decrypt_keyids(expected_key)
-        visible = [kid for kid in preflight["public_key_ids"] if set(kid) != {"0"}]
+        all_keyids = preflight["public_key_ids"]
+        hidden = [kid for kid in all_keyids if set(kid) == {"0"}]
+        visible = [kid for kid in all_keyids if set(kid) != {"0"}]
+        if hidden and not self.policy.allow_hidden_recipients:
+            raise PolicyError(
+                "ciphertext contains hidden recipients; set allow_hidden_recipients "
+                "to permit this"
+            )
         extra: list[str] = []
-        if preflight["public_key_ids"]:
-            if not visible:
-                if not self.policy.allow_hidden_recipients:
-                    raise PolicyError(
-                        "ciphertext hides its recipients; set allow_hidden_recipients "
-                        "to permit this"
-                    )
-            else:
-                extra = [
-                    kid
-                    for kid in visible
-                    if kid.upper() not in allowed_keyids
-                    and kid.upper()[-16:] not in allowed_keyids
-                ]
-                matched = any(
-                    kid.upper() in allowed_keyids or kid.upper()[-16:] in allowed_keyids
-                    for kid in visible
+        if visible:
+            extra = [
+                kid
+                for kid in visible
+                if kid.upper() not in allowed_keyids
+                and kid.upper()[-16:] not in allowed_keyids
+            ]
+            matched = any(
+                kid.upper() in allowed_keyids or kid.upper()[-16:] in allowed_keyids
+                for kid in visible
+            )
+            if not matched:
+                raise PolicyError(
+                    "ciphertext is not addressed to an allowed decryption key"
                 )
-                if not matched:
-                    raise PolicyError(
-                        "ciphertext is not addressed to an allowed decryption key"
-                    )
         result = await self.run(
             ["--decrypt", "--no-symkey-cache"], input_data=ciphertext, check=False
         )
@@ -1213,45 +1241,177 @@ class Gpg:
             code="revocation_not_found",
         )
 
-    async def generate_revocation(self, fingerprint: str) -> dict[str, Any]:
-        fpr = assert_manage_key_allowed(self.policy, fingerprint)
-        path = self._revocation_path(fpr)
-        cert = clean_revocation_certificate(path.read_text(encoding="utf-8"))
-        if contains_secret_material(cert):
-            raise GpgMcpError("revocation certificate unexpectedly contained key material")
-        if not cert.startswith("-----BEGIN PGP PUBLIC KEY BLOCK-----"):
-            raise GpgMcpError("could not extract an armored revocation certificate")
-        return {
-            "fingerprint": fpr,
-            "revocation_certificate": cert,
-            "warning": "This certificate can permanently revoke the key. Store it offline.",
-        }
+    async def _resolve_revocation_issuer(self, packet_info: dict[str, Any]) -> str:
+        issuers = packet_info["issuer_fingerprints"]
+        if len(issuers) == 1:
+            return next(iter(issuers))
+        if len(issuers) > 1:
+            raise PolicyError("revocation certificate names multiple issuers")
+        keyids = {keyid for keyid in packet_info["keyids"] if set(keyid) != {"0"}}
+        if not keyids:
+            raise PolicyError("revocation certificate does not identify an issuer")
+        matches: set[str] = set()
+        for key in await self.list_keys():
+            for item in [key, *key["subkeys"]]:
+                if item.get("key_id") in keyids and key.get("fingerprint"):
+                    matches.add(key["fingerprint"])
+        if len(matches) != 1:
+            raise PolicyError("could not resolve a unique issuer for the revocation certificate")
+        return next(iter(matches))
 
-    async def import_revocation(self, certificate: bytes, *, apply: bool = False) -> dict[str, Any]:
+    async def inspect_revocation(
+        self, certificate: bytes, *, expected_fingerprint: str | None = None
+    ) -> dict[str, Any]:
+        """Validate a revocation certificate without touching the real keyring.
+
+        The certificate is verified against the target public key in an
+        ephemeral keyring. This rejects secret keys, unrelated public keys,
+        certificates for another key, and certificates that do not revoke the
+        target. The returned ``certificate`` is normalized and safe to import.
+        """
         if contains_secret_material(certificate.decode("utf-8", errors="ignore")):
             raise PolicyError("secret key material is not accepted")
         text = certificate.decode("utf-8", errors="ignore")
         if "-----BEGIN PGP PUBLIC KEY BLOCK-----" in text:
-            certificate = clean_revocation_certificate(text).encode("utf-8")
-        result = await self.run(["--import"], input_data=certificate, check=False)
+            normalized = clean_revocation_certificate(text)
+            if not normalized.startswith("-----BEGIN PGP PUBLIC KEY BLOCK-----"):
+                raise PolicyError("could not extract an armored revocation certificate")
+            certificate = normalized.encode("utf-8")
+        _, packet_text = await self._list_packets(certificate)
+        if re.search(r":secret (?:sub )?key packet:", packet_text):
+            raise PolicyError("secret key material is not accepted")
+        info = revocation_packet_info(packet_text)
+        if not info["has_revocation_signature"]:
+            raise PolicyError("input does not contain a revocation signature")
+        if info["hidden_keyids"]:
+            raise PolicyError("revocation certificate hides its issuer")
+        issuer = await self._resolve_revocation_issuer(info)
+        if expected_fingerprint:
+            expected = require_fingerprint(expected_fingerprint)
+            if issuer != expected:
+                raise PolicyError(
+                    f"certificate targets {issuer}, not the requested {expected}"
+                )
+        key = await self.get_key(issuer)
+        uids = key["uids"]
+
+        temp_home = Path(tempfile.mkdtemp(prefix="gpg-mcp-revocation-"))
+        os.chmod(temp_home, 0o700)
+        try:
+            exported = await self.run(["--armor", "--export", issuer], use_status=False)
+            if not exported.stdout:
+                raise PolicyError("target key is not present in the keyring")
+            await self.run(["--import"], input_data=exported.stdout, home=temp_home)
+            imported = await self.run(
+                ["--import"], input_data=certificate, home=temp_home, check=False
+            )
+            summary = _import_summary(imported.status)
+            if imported.returncode != 0 and not summary["imported"]:
+                raise GpgMcpError(
+                    "revocation certificate could not be applied to the target key",
+                    detail=imported.stderr,
+                )
+            listing = await self.run(
+                ["--with-colons", "--list-keys"],
+                home=temp_home,
+                check=False,
+                use_status=False,
+            )
+            temp_keys = parse_colon_keys(listing.text)
+            if len(temp_keys) != 1:
+                raise PolicyError(
+                    "certificate does not target exactly the requested key"
+                )
+            temp_key = temp_keys[0]
+            if temp_key.get("fingerprint") != issuer:
+                raise PolicyError("certificate targets a different key")
+            if temp_key.get("validity") != "revoked":
+                raise PolicyError("certificate does not revoke the target key")
+            return {
+                "fingerprint": issuer,
+                "uid": uids[0]["uid"] if uids else None,
+                "uids": uids,
+                "revoked": True,
+                "certificate": certificate,
+                "import_summary": summary,
+            }
+        finally:
+            if self.gpgconf:
+                with contextlib.suppress(Exception):
+                    await self.run_tool(
+                        self.gpgconf, ["--kill", "gpg-agent"], home=temp_home
+                    )
+            shutil.rmtree(temp_home, ignore_errors=True)
+
+    async def generate_revocation(self, fingerprint: str) -> dict[str, Any]:
+        fpr = assert_manage_key_allowed(self.policy, fingerprint)
+        path = self._revocation_path(fpr)
+        cert_text = clean_revocation_certificate(path.read_text(encoding="utf-8"))
+        if contains_secret_material(cert_text):
+            raise GpgMcpError("revocation certificate unexpectedly contained key material")
+        if not cert_text.startswith("-----BEGIN PGP PUBLIC KEY BLOCK-----"):
+            raise GpgMcpError("could not extract an armored revocation certificate")
+        validated = await self.inspect_revocation(
+            cert_text.encode("utf-8"), expected_fingerprint=fpr
+        )
+        return {
+            "fingerprint": fpr,
+            "uid": validated["uid"],
+            "revocation_certificate": cert_text,
+            "warning": "This certificate can permanently revoke the key. Store it offline.",
+        }
+
+    async def import_revocation(
+        self,
+        certificate: bytes,
+        *,
+        expected_fingerprint: str | None = None,
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        validated = await self.inspect_revocation(
+            certificate, expected_fingerprint=expected_fingerprint
+        )
+        fpr = validated["fingerprint"]
+        if not apply:
+            # True dry run: validation happened in an ephemeral keyring only.
+            return {
+                "applied": False,
+                "would_revoke": True,
+                "fingerprint": fpr,
+                "uid": validated["uid"],
+                "uids": validated["uids"],
+            }
+        result = await self.run(
+            ["--import"], input_data=validated["certificate"], check=False
+        )
         summary = _import_summary(result.status)
         if result.returncode != 0 and not summary["imported"]:
             raise self._execution_error(result)
-        return {"applied": apply, **summary}
+        after = await self.get_key(fpr)
+        if after.get("validity") != "revoked":
+            raise GpgMcpError(
+                "revocation import returned success but the key is not revoked",
+                code="revocation_not_applied",
+            )
+        return {
+            "applied": True,
+            "revoked": True,
+            "fingerprint": fpr,
+            "uid": validated["uid"],
+            "uids": validated["uids"],
+            **summary,
+        }
 
     async def revoke_key(self, fingerprint: str) -> dict[str, Any]:
         fpr = assert_manage_key_allowed(self.policy, fingerprint)
         path = self._revocation_path(fpr)
         cert = clean_revocation_certificate(path.read_text(encoding="utf-8")).encode("utf-8")
-        result = await self.run(["--import"], input_data=cert, check=False)
-        summary = _import_summary(result.status)
-        if result.returncode != 0 and not summary["imported"]:
-            raise self._execution_error(result)
+        result = await self.import_revocation(
+            cert, expected_fingerprint=fpr, apply=True
+        )
         return {
-            "fingerprint": fpr,
-            "revoked": True,
             "source": "openpgp-revocs.d",
-            **summary,
+            **result,
         }
 
     # -- network ------------------------------------------------------------

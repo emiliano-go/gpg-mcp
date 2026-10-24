@@ -100,3 +100,137 @@ async def test_destructive_requires_typed_suffix(approval_env, keyring) -> None:
         deleted = await call(client, "delete_key", fingerprint=fpr, secret=True)
         assert not deleted.is_error, deleted.content[0].text
         assert deleted.structured_content["deleted"] is True
+
+
+@pytest.mark.asyncio
+async def test_import_revocation_requires_typed_confirmation(approval_env, keyring) -> None:
+    import mcp.types as types
+    from mcp import Client
+
+    seen: list[tuple[str, dict]] = []
+    state = {"mode": "accept"}
+
+    async def cb(context, params):
+        props = params.requested_schema.get("properties") or {}
+        seen.append((params.message, props))
+        if state["mode"] == "decline":
+            return types.ElicitResult(action="decline")
+        content = {"approve": True}
+        if "confirmation" in props:
+            match = re.search(r"\(([0-9A-F]{8})\)", params.message)
+            content["confirmation"] = match.group(1) if match else "WRONG"
+        return types.ElicitResult(action="accept", content=content)
+
+    async with Client(mcp, elicitation_callback=cb) as client:
+        created = await call(
+            client,
+            "create_key",
+            uid="Approval Revocation <approval-revocation@example.com>",
+            protect=False,
+        )
+        assert not created.is_error, created.content[0].text
+        fpr = created.structured_content["fingerprint"]
+        cert = (
+            await call(client, "generate_revocation", fingerprint=fpr)
+        ).structured_content["revocation_certificate"]
+
+        dry = await call(
+            client,
+            "import_revocation",
+            fingerprint=fpr,
+            certificate=cert,
+            apply=False,
+        )
+        assert not dry.is_error, dry.content[0].text
+        assert dry.structured_content["applied"] is False
+        assert any(
+            "revocation certificate" in message and "confirmation" in props
+            for message, props in seen
+        )
+
+        state["mode"] = "decline"
+        denied = await call(
+            client,
+            "import_revocation",
+            fingerprint=fpr,
+            certificate=cert,
+            apply=False,
+        )
+        assert denied.is_error
+        assert "not approved" in denied.content[0].text
+
+        state["mode"] = "accept"
+        ok_delete = await call(client, "delete_key", fingerprint=fpr, secret=True)
+        assert not ok_delete.is_error, ok_delete.content[0].text
+
+
+@pytest.fixture
+def composite_env(monkeypatch, keyring):
+    def _make(required: list[str]) -> None:
+        path = keyring.config.parent / f"composite-{'-'.join(required)}.toml"
+        path.write_text(
+            f'gnupg_home = "{keyring.home}"\n'
+            f'audit_log = "{keyring.home.parent / "audit-composite.jsonl"}"\n'
+            'approval = "client"\n'
+            "enable_network = false\n"
+            "enable_symmetric = false\n"
+            "allow_unprotected_keys = true\n"
+            f"require_approval = {required!r}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("GPG_MCP_CONFIG", str(path))
+        reset_policy_cache()
+        reset_gpg()
+
+    yield _make
+    monkeypatch.undo()
+    reset_policy_cache()
+    reset_gpg()
+
+
+@pytest.mark.asyncio
+async def test_encrypt_with_sign_requires_sign_approval(composite_env, keyring) -> None:
+    import mcp.types as types
+    from mcp import Client
+
+    composite_env(["sign"])
+    calls = {"count": 0}
+
+    async def cb(context, params):
+        calls["count"] += 1
+        return types.ElicitResult(action="accept", content={"approve": True})
+
+    async with Client(mcp, elicitation_callback=cb) as client:
+        result = await call(
+            client,
+            "encrypt",
+            data="composite",
+            recipients=[keyring.fpr],
+            sign_with=keyring.fpr,
+        )
+        assert not result.is_error, result.content[0].text
+    assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sign_and_encrypt_requires_encrypt_approval(composite_env, keyring) -> None:
+    import mcp.types as types
+    from mcp import Client
+
+    composite_env(["encrypt"])
+    calls = {"count": 0}
+
+    async def cb(context, params):
+        calls["count"] += 1
+        return types.ElicitResult(action="accept", content={"approve": True})
+
+    async with Client(mcp, elicitation_callback=cb) as client:
+        result = await call(
+            client,
+            "sign_and_encrypt",
+            data="composite",
+            recipients=[keyring.fpr],
+            signer=keyring.fpr,
+        )
+        assert not result.is_error, result.content[0].text
+    assert calls["count"] == 1

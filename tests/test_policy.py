@@ -106,3 +106,41 @@ def test_secret_material_detection_and_redaction() -> None:
     assert contains_secret_material(secret)
     assert "redacted" in redact(secret)
     assert not contains_secret_material("-----BEGIN PGP PUBLIC KEY BLOCK-----")
+
+
+def test_default_approval_includes_revocation_and_destructive_ops(tmp_path) -> None:
+    policy = _config(tmp_path, f'gnupg_home = "{tmp_path}"\n')
+    assert {"import_revocation", "delete_key", "revoke_key"} <= policy.require_approval
+
+
+def test_unknown_operation_requires_approval(tmp_path) -> None:
+    from gpg_mcp.policy import assert_registered_operation, requires_approval
+
+    policy = _config(tmp_path, f'gnupg_home = "{tmp_path}"\n')
+    assert requires_approval(policy, "future_tool") is True
+    with pytest.raises(PolicyError):
+        assert_registered_operation("future_tool")
+
+
+def test_composite_operations_inherit_constituent_approval(tmp_path) -> None:
+    from dataclasses import replace
+
+    from gpg_mcp.policy import requires_approval
+
+    base = _config(tmp_path, f'gnupg_home = "{tmp_path}"\n')
+    only_sign = replace(base, require_approval=frozenset({"sign"}))
+    only_encrypt = replace(base, require_approval=frozenset({"encrypt"}))
+    neither = replace(base, require_approval=frozenset())
+    assert requires_approval(only_sign, "sign_and_encrypt") is True
+    assert requires_approval(only_encrypt, "sign_and_encrypt") is True
+    assert requires_approval(neither, "sign_and_encrypt") is False
+
+
+def test_all_high_risk_tools_are_registered() -> None:
+    from gpg_mcp.policy import ALL_OPERATIONS, READ_ONLY_TOOLS
+    from gpg_mcp.server import mcp
+
+    names = {tool.name for tool in mcp._tool_manager.list_tools()}
+    assert names - READ_ONLY_TOOLS <= ALL_OPERATIONS
+    assert "import_revocation" in ALL_OPERATIONS
+    assert "sign_and_encrypt" in ALL_OPERATIONS

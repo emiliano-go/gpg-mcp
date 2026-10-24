@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import (
@@ -25,8 +23,15 @@ from mcp.server.mcpserver import (
 )
 from pydantic import BaseModel, Field
 
+from .binaries import secure_binary
 from .errors import GpgMcpError
-from .policy import audit, get_policy
+from .policy import (
+    Operation,
+    assert_registered_operation,
+    audit,
+    get_policy,
+    requires_approval,
+)
 
 
 class Confirm(BaseModel):
@@ -72,12 +77,13 @@ def payload_summary(action: str, data: bytes, *, key: str = "", extra: str = "")
 
 
 def _zenity() -> str | None:
-    found = shutil.which("zenity")
-    if not found:
-        return None
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         return None
-    return str(Path(found).resolve())
+    try:
+        return secure_binary("zenity", required=False)
+    except GpgMcpError:
+        # An unsafe zenity must fail closed, never imitate approval.
+        return None
 
 
 async def _zenity_question(summary: str) -> bool:
@@ -138,47 +144,69 @@ async def _zenity_entry(summary: str, prompt: str) -> str | None:
         return None
 
 
-async def request(op: str, summary: str) -> Confirm | Elicit[Confirm]:
-    """Return a decision, or ask the MCP client to decide."""
+def _required_operations(ops: list[str]) -> tuple[Any, list[str]]:
+    """Resolve the operations that actually require approval.
+
+    Unknown operation names raise instead of being treated as pre-approved.
+    Composite operations inherit every constituent's requirement.
+    """
     policy = get_policy()
-    if op not in policy.require_approval:
+    for op in ops:
+        assert_registered_operation(op)
+    required = [op for op in ops if requires_approval(policy, op)]
+    return policy, required
+
+
+def _audit_approval(policy: Any, ops: list[str], decision: str, *, destructive: bool = False) -> None:
+    # Deliberately no summary: summaries contain payload previews.
+    audit(
+        policy,
+        {
+            "event": "approval",
+            "operations": ops,
+            "decision": decision,
+            "destructive": destructive,
+        },
+    )
+
+
+async def request_all(ops: list[str], summary: str) -> Confirm | Elicit[Confirm]:
+    """Ask once when any constituent operation requires approval."""
+    policy, required = _required_operations(ops)
+    if not required:
         return Confirm(approve=True)
     if policy.approval == "none":
-        audit(policy, {"event": "approval", "tool": op, "decision": "skipped", "summary": summary})
+        _audit_approval(policy, required, "skipped")
         return Confirm(approve=True)
     if policy.approval == "local":
         approved = await _zenity_question(summary)
-        audit(
-            policy,
-            {
-                "event": "approval",
-                "tool": op,
-                "decision": "local_accept" if approved else "local_decline",
-                "summary": summary,
-            },
-        )
+        _audit_approval(policy, required, "local_accept" if approved else "local_decline")
         return Confirm(approve=approved)
     return Elicit(summary, Confirm)
+
+
+async def request(op: str, summary: str) -> Confirm | Elicit[Confirm]:
+    """Return a decision, or ask the MCP client to decide."""
+    return await request_all([op], summary)
 
 
 async def request_destructive(
     op: str, summary: str, fingerprint: str
 ) -> DestructiveConfirm | Elicit[DestructiveConfirm]:
-    policy = get_policy()
+    spec: Operation = assert_registered_operation(op)
+    if not spec.destructive:
+        raise GpgMcpError(
+            f"{op} is not registered as destructive; refusing destructive approval path",
+            code="policy_error",
+        )
+    policy, required = _required_operations([op])
     suffix = fingerprint[-8:].upper()
-    if op not in policy.require_approval:
+    if not required:
+        # Explicit configuration opt-out. The default policy requires this.
+        _audit_approval(policy, [op], "configured_skip", destructive=True)
         return DestructiveConfirm(approve=True, confirmation=suffix)
     if policy.approval == "none":
-        audit(
-            policy,
-            {
-                "event": "approval",
-                "tool": op,
-                "decision": "skipped",
-                "destructive": True,
-                "summary": summary,
-            },
-        )
+        _audit_approval(policy, required, "skipped", destructive=True)
         return DestructiveConfirm(approve=True, confirmation=suffix)
     if policy.approval == "local":
         approved = await _zenity_question(summary)
@@ -188,15 +216,8 @@ async def request_destructive(
             else None
         )
         ok = bool(approved and typed and typed.strip().upper() == suffix)
-        audit(
-            policy,
-            {
-                "event": "approval",
-                "tool": op,
-                "decision": "local_accept" if ok else "local_decline",
-                "destructive": True,
-                "summary": summary,
-            },
+        _audit_approval(
+            policy, required, "local_accept" if ok else "local_decline", destructive=True
         )
         return DestructiveConfirm(approve=ok, confirmation=typed or "")
     return Elicit(
@@ -249,12 +270,20 @@ def evaluate_destructive(
             return Decision(False, "no approval")
 
 
-def record_decision(op: str, decision: Decision, *, fingerprint: str | None = None, **extra: Any) -> None:
+def record_decision(
+    op: str,
+    decision: Decision,
+    *,
+    fingerprint: str | None = None,
+    operations: list[str] | None = None,
+    **extra: Any,
+) -> None:
     audit(
         get_policy(),
         {
             "event": "approval_result",
-            "tool": op,
+            "operation": op,
+            "operations": operations or [op],
             "decision": decision.reason,
             "approved": decision.approved,
             "fingerprint": fingerprint,

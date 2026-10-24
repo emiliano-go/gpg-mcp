@@ -30,25 +30,97 @@ _SIGN_ALGOS = {"ed25519", "rsa3072", "rsa4096", "future-default", "default"}
 _SUBKEY_ALGOS = {"cv25519", "ed25519", "rsa3072", "rsa4096", "future-default", "default"}
 _APPROVAL_MODES = {"client", "local", "none"}
 _OWNERTRUST = {"never", "marginal", "full"}
-_OPS = {
-    "sign",
-    "decrypt",
-    "encrypt",
-    "create_key",
-    "add_subkey",
-    "add_uid",
-    "set_expiry",
-    "change_passphrase",
-    "delete_key",
-    "import_public_key",
-    "set_ownertrust",
-    "generate_revocation",
-    "revoke_key",
-    "send_key",
-    "symmetric_encrypt",
-    "symmetric_decrypt",
-    "set_default_key",
+
+
+@dataclass(frozen=True)
+class Operation:
+    """Authorization metadata for one MCP-facing operation.
+
+    ``constituents`` models composite actions. Approval is required when the
+    operation itself is in ``require_approval`` *or* any constituent is, so a
+    custom policy cannot approve signing but silently allow sign-and-encrypt.
+    """
+
+    name: str
+    destructive: bool = False
+    constituents: tuple[str, ...] = ()
+    description: str = ""
+
+
+OPERATIONS: dict[str, Operation] = {
+    "sign": Operation("sign", description="Sign data"),
+    "encrypt": Operation("encrypt", description="Encrypt data"),
+    "sign_and_encrypt": Operation(
+        "sign_and_encrypt",
+        constituents=("sign", "encrypt"),
+        description="Sign and encrypt data",
+    ),
+    "decrypt": Operation("decrypt", description="Decrypt ciphertext"),
+    "symmetric_encrypt": Operation("symmetric_encrypt", description="Symmetric encryption"),
+    "symmetric_decrypt": Operation("symmetric_decrypt", description="Symmetric decryption"),
+    "create_key": Operation("create_key", description="Create a key"),
+    "add_subkey": Operation("add_subkey", description="Add a subkey"),
+    "add_uid": Operation("add_uid", description="Add a user ID"),
+    "set_expiry": Operation("set_expiry", description="Change key expiry"),
+    "change_passphrase": Operation("change_passphrase", description="Change a passphrase"),
+    "import_public_key": Operation("import_public_key", description="Import a public key"),
+    "import_revocation": Operation(
+        "import_revocation",
+        destructive=True,
+        description="Apply a revocation certificate",
+    ),
+    "generate_revocation": Operation(
+        "generate_revocation", description="Export a revocation certificate"
+    ),
+    "revoke_key": Operation("revoke_key", destructive=True, description="Revoke a key"),
+    "delete_key": Operation("delete_key", destructive=True, description="Delete a key"),
+    "set_ownertrust": Operation("set_ownertrust", description="Set ownertrust"),
+    "send_key": Operation("send_key", description="Publish a public key"),
 }
+
+ALL_OPERATIONS = frozenset(OPERATIONS)
+READ_ONLY_TOOLS = frozenset(
+    {
+        "list_keys",
+        "get_key",
+        "export_public_key",
+        "export_ssh_key",
+        "inspect",
+        "inspect_recipients",
+        "verify",
+        "card_status",
+        "agent_info",
+        "doctor",
+        "search_keyserver",
+        "fetch_key",
+    }
+)
+
+
+def operation_spec(name: str) -> Operation | None:
+    return OPERATIONS.get(name)
+
+
+def assert_registered_operation(name: str) -> Operation:
+    spec = OPERATIONS.get(name)
+    if spec is None:
+        raise PolicyError(
+            f"operation {name!r} is not registered in the authorization policy"
+        )
+    return spec
+
+
+def requires_approval(policy: Policy, name: str) -> bool:
+    """Fail closed: unknown operations always require approval.
+
+    Composite operations inherit the requirement of every constituent.
+    """
+    spec = OPERATIONS.get(name)
+    if spec is None:
+        return True
+    if name in policy.require_approval:
+        return True
+    return any(requires_approval(policy, constituent) for constituent in spec.constituents)
 
 
 @dataclass(frozen=True)
@@ -158,10 +230,10 @@ def load_policy(path: Path | None = None, *, env: dict[str, str] | None = None) 
     if approval not in _APPROVAL_MODES:
         raise InputError(f"approval must be one of {sorted(_APPROVAL_MODES)}")
 
-    require = raw.get("require_approval", sorted(_OPS))
+    require = raw.get("require_approval", sorted(ALL_OPERATIONS))
     if not isinstance(require, list) or not all(isinstance(v, str) for v in require):
         raise InputError("require_approval must be a list of operation names")
-    unknown = set(require) - _OPS
+    unknown = set(require) - ALL_OPERATIONS
     if unknown:
         raise InputError(f"unknown operations in require_approval: {sorted(unknown)}")
 
@@ -403,8 +475,12 @@ def audit(policy: Policy, record: dict[str, Any]) -> None:
     }
     line = json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n"
     try:
-        policy.audit_log.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(policy.audit_log.parent, 0o700)
+        parent = policy.audit_log.parent
+        if not parent.exists():
+            # Only tighten permissions on a directory this process creates.
+            # Never chmod an existing arbitrary parent (for example /tmp).
+            parent.mkdir(parents=True, mode=0o700)
+            os.chmod(parent, 0o700)
         fd = os.open(
             policy.audit_log,
             os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),

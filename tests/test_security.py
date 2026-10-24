@@ -121,7 +121,27 @@ async def test_hidden_recipients_rejected_by_default(connect, keyring) -> None:
     async with connect() as client:
         result = await call(client, "decrypt", ciphertext=hidden)
         assert result.is_error
-        assert "hides its recipients" in result.content[0].text
+        assert "hidden recipients" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_mixed_hidden_and_visible_recipients_rejected(connect, keyring) -> None:
+    mixed = _gpg(
+        keyring,
+        "--armor",
+        "--trust-model",
+        "always",
+        "--recipient",
+        keyring.fpr,
+        "--hidden-recipient",
+        keyring.fpr2,
+        "--encrypt",
+        input_data=b"mixed message",
+    ).decode("utf-8")
+    async with connect() as client:
+        result = await call(client, "decrypt", ciphertext=mixed)
+        assert result.is_error
+        assert "hidden recipients" in result.content[0].text
 
 
 @pytest.mark.asyncio

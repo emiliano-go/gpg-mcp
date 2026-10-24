@@ -24,6 +24,7 @@ from .approval import (
     payload_summary,
     record_decision,
     request,
+    request_all,
     request_destructive,
     require_approved,
 )
@@ -84,6 +85,19 @@ def _hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+async def _key_label(fingerprint: str | None) -> str:
+    """Human-readable signer/recipient label for approval forms."""
+    fpr = (fingerprint or "").strip().upper()
+    if not fpr:
+        return "unspecified"
+    try:
+        key = await gpg().get_key(fpr)
+    except Exception:  # noqa: BLE001 - labels are best effort
+        return fpr
+    uids = ", ".join(item["uid"] for item in key["uids"][:2])
+    return f"{fpr} ({uids})" if uids else fpr
+
+
 # ---------------------------------------------------------------------------
 # approval resolvers
 # ---------------------------------------------------------------------------
@@ -102,7 +116,7 @@ async def _ask_sign(
         payload_summary(
             "sign data",
             payload,
-            key=signer,
+            key=await _key_label(signer),
             extra=f"Mode: {mode}\nArmor: {armor}\nHash: {hash_algo}",
         ),
     )
@@ -116,14 +130,18 @@ async def _ask_encrypt(
     armor: bool = True,
 ) -> Confirm | Elicit[Confirm]:
     payload = _decode(data, data_base64)
-    return await request(
-        "encrypt",
+    recipient_labels = [await _key_label(recipient) for recipient in (recipients or [])]
+    recipient_text = "\n".join(f"- {label}" for label in recipient_labels) or "- none"
+    signer_label = await _key_label(sign_with) if sign_with else "no"
+    operations = ["encrypt"] + (["sign"] if sign_with else [])
+    return await request_all(
+        operations,
         payload_summary(
             "encrypt data",
             payload,
             extra=(
-                f"Recipients: {', '.join(recipients or [])}\n"
-                f"Sign with: {sign_with or 'no'}\nArmor: {armor}"
+                f"Recipients:\n{recipient_text}\n"
+                f"Sign with: {signer_label}\nArmor: {armor}"
             ),
         ),
     )
@@ -137,13 +155,15 @@ async def _ask_sign_and_encrypt(
     armor: bool = True,
 ) -> Confirm | Elicit[Confirm]:
     payload = _decode(data, data_base64)
-    return await request(
-        "sign",
+    recipient_labels = [await _key_label(recipient) for recipient in (recipients or [])]
+    recipient_text = "\n".join(f"- {label}" for label in recipient_labels) or "- none"
+    return await request_all(
+        ["sign", "encrypt"],
         payload_summary(
             "sign and encrypt data",
             payload,
-            key=signer,
-            extra=f"Recipients: {', '.join(recipients or [])}\nArmor: {armor}",
+            key=await _key_label(signer),
+            extra=f"Recipients:\n{recipient_text}\nArmor: {armor}",
         ),
     )
 
@@ -155,12 +175,13 @@ async def _ask_decrypt(
     expected_key: str | None = None,
 ) -> Confirm | Elicit[Confirm]:
     payload = _decode(ciphertext, ciphertext_base64)
+    label = await _key_label(expected_key) if expected_key else "auto"
     return await request(
         "decrypt",
         payload_summary(
             "decrypt ciphertext",
             payload,
-            key=expected_key or "auto",
+            key=label,
             extra=f"Verify embedded signature: {verify}\nPlaintext will be returned.",
         ),
     )
@@ -257,9 +278,10 @@ async def _ask_set_ownertrust(fingerprint: str = "", level: str = "") -> Confirm
 
 
 async def _ask_generate_revocation(fingerprint: str = "") -> Confirm | Elicit[Confirm]:
+    fpr = require_fingerprint(fingerprint)
     return await request(
         "generate_revocation",
-        f"gpg-mcp wants to export the revocation certificate for {fingerprint}.\n"
+        f"gpg-mcp wants to export the revocation certificate for {await _key_label(fpr)}.\n"
         "This certificate can permanently revoke the key; store it offline.",
     )
 
@@ -287,10 +309,10 @@ async def _ask_delete_key(
 
 
 async def _ask_revoke_key(fingerprint: str = "") -> DestructiveConfirm | Elicit[DestructiveConfirm]:
-    fpr = fingerprint.strip().upper()
+    fpr = require_fingerprint(fingerprint)
     return await request_destructive(
         "revoke_key",
-        f"gpg-mcp wants to REVOKE this key permanently.\nFingerprint: {fpr}",
+        f"gpg-mcp wants to REVOKE this key permanently.\nTarget: {await _key_label(fpr)}",
         fpr,
     )
 
@@ -302,16 +324,20 @@ async def _ask_import_revocation(
     apply: bool = True,
 ) -> DestructiveConfirm | Elicit[DestructiveConfirm]:
     payload = _decode(certificate, certificate_base64)
-    fpr = fingerprint.strip().upper()
+    requested = require_fingerprint(fingerprint)
+    validated = await gpg().inspect_revocation(
+        payload, expected_fingerprint=requested
+    )
+    actual = validated["fingerprint"]
+    label = actual
+    if validated.get("uid"):
+        label += f" ({validated['uid']})"
+    action = "apply" if apply else "validate without applying"
     return await request_destructive(
         "import_revocation",
-        payload_summary(
-            "apply a revocation certificate",
-            payload,
-            key=fpr,
-            extra=f"Apply immediately: {apply}",
-        ),
-        fpr,
+        f"gpg-mcp wants to {action} a revocation certificate.\n"
+        f"Target: {label}\nThis permanently revokes the key.",
+        actual,
     )
 
 
@@ -443,7 +469,8 @@ async def encrypt(
     """Encrypt data to one or more full recipient fingerprints."""
     payload = _decode(data, data_base64)
     decision = evaluate(approval)
-    record_decision("encrypt", decision)
+    operations = ["encrypt"] + (["sign"] if sign_with else [])
+    record_decision("encrypt", decision, operations=operations)
     require_approved(decision, "encrypt")
     result = await gpg().encrypt(
         payload, recipients=recipients or [], sign_with=sign_with, armor=armor
@@ -472,7 +499,12 @@ async def sign_and_encrypt(
     payload = _decode(data, data_base64)
     fpr = require_fingerprint(signer, what="signer")
     decision = evaluate(approval)
-    record_decision("sign", decision, fingerprint=fpr)
+    record_decision(
+        "sign_and_encrypt",
+        decision,
+        fingerprint=fpr,
+        operations=["sign", "encrypt"],
+    )
     require_approved(decision, "sign_and_encrypt")
     result = await gpg().sign_and_encrypt(
         payload, recipients=recipients or [], signer=fpr, armor=armor
@@ -718,13 +750,17 @@ async def import_revocation(
     """Apply a revocation certificate. Requires typed confirmation of the fingerprint."""
     fpr = require_fingerprint(fingerprint)
     payload = _decode(certificate, certificate_base64)
-    decision = evaluate_destructive(approval, fpr)
-    record_decision("import_revocation", decision, fingerprint=fpr)
+    validated = await gpg().inspect_revocation(payload, expected_fingerprint=fpr)
+    actual = validated["fingerprint"]
+    decision = evaluate_destructive(approval, actual)
+    record_decision("import_revocation", decision, fingerprint=actual)
     require_approved(decision, "import_revocation")
-    result = await gpg().import_revocation(payload, apply=apply)
+    result = await gpg().import_revocation(
+        payload, expected_fingerprint=fpr, apply=apply
+    )
     _audit(
         "import_revocation",
-        fingerprint=fpr,
+        fingerprint=actual,
         certificate_sha256=_hash(payload),
         applied=apply,
         result="ok",

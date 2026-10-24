@@ -59,7 +59,56 @@ def test_verification_rejects_bad_signature() -> None:
 
 
 def test_verification_marks_revoked_key() -> None:
-    events = parse_status("[GNUPG:] REVKEYSIG A6314C63B4A19DF3 Test\n")
+    events = parse_status(
+        "[GNUPG:] VALIDSIG A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B "
+        "2026-10-24 1792883400 0 5 0 22 8 00 "
+        "A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B\n"
+        "[GNUPG:] REVKEYSIG A6314C63B4A19DF3 Test\n"
+    )
     info = _verification(events)
+    assert info["cryptographically_valid"] is True
     assert info["valid"] is False
+    assert info["policy_acceptable"] is False
     assert info["key_revoked"] is True
+
+
+def test_expired_signature_is_not_policy_acceptable() -> None:
+    events = parse_status(
+        "[GNUPG:] VALIDSIG A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B "
+        "2026-10-24 1792883400 0 5 0 22 8 00 "
+        "A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B\n"
+        "[GNUPG:] EXPSIG A6314C63B4A19DF3 Test\n"
+        "[GNUPG:] SIGEXPIRED\n"
+    )
+    info = _verification(events)
+    assert info["cryptographically_valid"] is True
+    assert info["policy_acceptable"] is False
+    assert info["valid"] is False
+    assert info["sig_expired"] is True
+
+
+def test_expired_key_is_not_policy_acceptable() -> None:
+    events = parse_status(
+        "[GNUPG:] VALIDSIG A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B "
+        "2026-10-24 1792883400 0 5 0 22 8 00 "
+        "A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B\n"
+        "[GNUPG:] EXPKEYSIG A6314C63B4A19DF3 Test\n"
+        "[GNUPG:] KEYEXPIRED 1792883400\n"
+    )
+    info = _verification(events)
+    assert info["cryptographically_valid"] is True
+    assert info["policy_acceptable"] is False
+    assert info["valid"] is False
+    assert info["key_expired"] is True
+
+
+def test_missing_key_is_not_policy_acceptable() -> None:
+    events = parse_status(
+        "[GNUPG:] ERRSIG A6314C63B4A19DF3 22 8 00 1792883400 9 -\n"
+        "[GNUPG:] NO_PUBKEY A6314C63B4A19DF3\n"
+    )
+    info = _verification(events)
+    assert info["cryptographically_valid"] is False
+    assert info["policy_acceptable"] is False
+    assert info["valid"] is False
+    assert info["missing_key"] is True
