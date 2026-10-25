@@ -1,0 +1,39 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.emiliano-go/gpg-mcp",
+  "title": "gpg-mcp",
+  "description": "Security-focused MCP server for GnuPG signing, encryption and key management.",
+  "repository": {
+    "url": "https://github.com/emiliano-go/gpg-mcp",
+    "source": "github",
+    "id": "1432677419"
+  },
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/emiliano-go/gpg-mcp",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "gpg-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "packageArguments": [
+        {
+          "type": "positional",
+          "valueHint": "command",
+          "value": "serve"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "GPG_MCP_CONFIG",
+          "description": "Optional path to the gpg-mcp config file.",
+          "isRequired": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

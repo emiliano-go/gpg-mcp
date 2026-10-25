@@ -6,9 +6,10 @@ build-backend = "hatchling.build"
 name = "gpg-mcp"
 version = "0.1.0"
 description = "A security-focused Model Context Protocol server for GnuPG"
-readme = "README.md"
+readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Emiliano G.O." }]
 keywords = ["gpg", "gnupg", "openpgp", "mcp", "security", "signing"]
 classifiers = [
@@ -20,9 +21,17 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Operating System :: POSIX",
   "Topic :: Security :: Cryptography",
 ]
 dependencies = ["mcp>=2.3,<3"]
+
+[project.urls]
+Homepage = "https://github.com/emiliano-go/gpg-mcp"
+Repository = "https://github.com/emiliano-go/gpg-mcp"
+Issues = "https://github.com/emiliano-go/gpg-mcp/issues"
+Security = "https://github.com/emiliano-go/gpg-mcp/security/policy"
+Releases = "https://github.com/emiliano-go/gpg-mcp/releases"
 
 [project.optional-dependencies]
 dev = [
@@ -36,6 +45,18 @@ gpg-mcp = "gpg_mcp.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gpg_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  "/README.md",
+  "/LICENSE",
+  "/SECURITY.md",
+  "/pyproject.toml",
+  "/server.json",
+  "/release",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
