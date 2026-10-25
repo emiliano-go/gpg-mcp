@@ -195,6 +195,17 @@ Add it to your MCP client (example for a JSON `mcpServers` map):
 Then, from the agent, create a key with `create_key` (the passphrase is entered into pinentry) and
 use the returned fingerprint with `sign`, `encrypt` or `decrypt`.
 
+> **Client timeout:** approval plus pinentry can take longer than a client's default MCP tool
+> timeout. Set it to at least 120 seconds; 300 seconds is a comfortable default for key generation
+> and passphrase changes. For opencode:
+>
+> ```json
+> "experimental": { "mcp_timeout": 300000 }
+> ```
+>
+> If the client times out while a dialog is open, cancel the dialog. The server does not
+> auto-approve and will deny the operation.
+
 > The dedicated keyring starts empty. `gpg-mcp` will not copy or export your existing secret keys.
 > To reuse an existing key, move it yourself out-of-band, or keep using `~/.gnupg` with an explicit
 > `allowed_sign_keys`/`allowed_decrypt_keys` allow-list.
