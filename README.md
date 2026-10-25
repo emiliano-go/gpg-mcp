@@ -93,8 +93,10 @@ fixed, typed surface with deliberate omissions:
     Existing audit files are `fstat`ed, non-regular/foreign-owned files are refused, and group/other
     access is tightened to `0600`. With `audit_required = true`, an audit failure fails the
     operation. `init` securely creates the config with `O_EXCL|O_NOFOLLOW` and refuses a symlinked
-    `gpg-agent.conf` instead of writing through or chmodding its target. The audit path uses the same
-    directory-fd walk, so an unsafe ancestor cannot redirect the ledger.
+    `gpg-agent.conf` instead of writing through or chmodding its target. Missing config, keyring and
+    audit directories are created component-by-component relative to already validated directory
+    descriptors, so a symlinked ancestor cannot redirect or create anything before rejection. The
+    audit path uses the same directory-fd walk, so an unsafe ancestor cannot redirect the ledger.
 18. **Decryption routing is unambiguous.** `symmetric_decrypt` rejects hybrid ciphertext that also
     carries public-key recipients. `decrypt` rejects symmetric-only ciphertext and refuses to return
     plaintext unless GnuPG reports an actual allow-listed public key; it never falls back to the
@@ -106,6 +108,10 @@ fixed, typed surface with deliberate omissions:
     GnuPG versions without `--proc-all-sigs`. Cleartext, inline, and embedded signatures use
     `--proc-all-sigs` when supported. On older GnuPG a bad-first message may stop enumeration at
     the first bad signature, but it is still rejected; all-good messages enumerate every signature.
+20. **Symmetric decryption is equally strict.** It requires `DECRYPTION_OKAY`, rejects
+    `DECRYPTION_FAILED`, `BADMDC`, `ERROR` and `FAILURE`, and treats unexplained nonzero exits as
+    fatal. With `verify=false`, a nonzero exit is tolerated only for an explicitly recognized
+    embedded-signature outcome; unrelated GnuPG failures are never excused.
 
 ### Verification result semantics
 
@@ -509,6 +515,8 @@ operations. It asserts, among other things, that:
 - the audit path rejects non-sticky writable ancestors;
 - multi-signature cleartext, inline, and embedded messages enumerate and aggregate correctly;
 - hybrid decryption tolerates only the recoverable symmetric-passphrase failure pattern;
+- symmetric decryption rejects unexplained nonzero exits and only excuses recognized signature failures when `verify=false`;
+- config, keyring and audit directory creation cannot write through a symlinked ancestor;
 - multiple signatures are enumerated and fail closed both with and without `--proc-all-sigs`;
 - hybrid symmetric/public-key ciphertext is rejected by `symmetric_decrypt`;
 - audit short writes, intent/outcome phases, and outcome failures are handled;

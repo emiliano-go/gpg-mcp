@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -312,6 +313,56 @@ def _open_dir_secure(path: Path) -> int:
             os.close(dir_fd)
             dir_fd = next_fd
         return dir_fd
+    except OSError as exc:
+        os.close(dir_fd)
+        raise PolicyError(f"cannot create secure directory: {exc}") from exc
+    except BaseException:
+        os.close(dir_fd)
+        raise
+
+
+def ensure_secure_dir(path: Path) -> int:
+    """Create missing directory components under a secure no-follow walk.
+
+    Returns an open descriptor for the final directory. Components are created
+    relative to the already validated parent descriptor, so a symlinked
+    ancestor cannot redirect creation.
+    """
+    absolute = Path(os.path.abspath(path))
+    parts = absolute.parts
+    dir_fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _check_secure_dir(dir_fd)
+        for part in parts[1:]:
+            created = False
+            try:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=dir_fd,
+                )
+            except FileNotFoundError:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, mode=0o700, dir_fd=dir_fd)
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=dir_fd,
+                )
+                created = True
+            _check_secure_dir(next_fd)
+            if created:
+                os.fchmod(next_fd, 0o700)
+            os.close(dir_fd)
+            dir_fd = next_fd
+        return dir_fd
+    except OSError as exc:
+        os.close(dir_fd)
+        raise PolicyError(f"cannot create secure directory: {exc}") from exc
     except BaseException:
         os.close(dir_fd)
         raise
@@ -337,11 +388,7 @@ def open_config_secure(path: Path) -> int:
 
 def open_audit_secure(path: Path) -> int:
     """Open an audit file relative to a securely walked parent."""
-    parent = path.parent
-    if not parent.exists():
-        parent.mkdir(parents=True, mode=0o700)
-        os.chmod(parent, 0o700)
-    dir_fd = _open_dir_secure(parent)
+    dir_fd = ensure_secure_dir(path.parent)
     try:
         return os.open(
             path.name,

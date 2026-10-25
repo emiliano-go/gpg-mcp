@@ -531,6 +531,53 @@ def decryption_status_ok(
     return hybrid and symkey_error and has_key
 
 
+_SIGNATURE_FAILURE_EVENTS = {
+    "BADSIG",
+    "ERRSIG",
+    "EXPKEYSIG",
+    "EXPSIG",
+    "REVKEYSIG",
+    "NO_PUBKEY",
+    "KEYEXPIRED",
+    "SIGEXPIRED",
+    "KEYREVOKED",
+}
+
+
+def symmetric_decryption_status_ok(
+    status: list[StatusEvent], returncode: int, *, verify: bool
+) -> bool:
+    """Fail closed for symmetric decryption.
+
+    A nonzero exit is tolerated only when verify=False and the failure is an
+    explicitly recognized embedded-signature outcome. Unrelated errors,
+    failures, bad integrity checks or unexplained exits are fatal.
+    """
+    if not any(event.keyword == "DECRYPTION_OKAY" for event in status):
+        return False
+    if any(event.keyword in {"DECRYPTION_FAILED", "BADMDC"} for event in status):
+        return False
+    if any(event.keyword == "ERROR" for event in status):
+        return False
+    signature_failed = any(
+        event.keyword in _SIGNATURE_FAILURE_EVENTS for event in status
+    )
+    for event in status:
+        if event.keyword == "FAILURE":
+            if (
+                event.args
+                and event.args[0] == "gpg-exit"
+                and returncode != 0
+                and not verify
+                and signature_failed
+            ):
+                continue
+            return False
+    if returncode == 0:
+        return True
+    return (not verify) and signature_failed
+
+
 def _created_key(status: list[StatusEvent]) -> str | None:
     for ev in status:
         if ev.keyword == "KEY_CREATED" and len(ev.args) >= 2:
@@ -1393,12 +1440,16 @@ class Gpg:
         result = await self.run(
             decrypt_args, input_data=ciphertext, check=False
         )
-        if any(ev.keyword in {"DECRYPTION_FAILED", "BADMDC", "ERROR", "FAILURE"} for ev in result.status):
-            raise self._execution_error(result)
-        if result.returncode != 0 and not any(
-            ev.keyword == "DECRYPTION_OKAY" for ev in result.status
+        if not symmetric_decryption_status_ok(
+            result.status, result.returncode, verify=verify
         ):
-            raise self._execution_error(result)
+            if result.returncode != 0:
+                raise self._execution_error(result)
+            raise GpgMcpError(
+                "gpg reported a fatal symmetric decryption status",
+                code="decryption_failed",
+                data={"status": result.status_dict()},
+            )
         sig = _verification(result.status)
         has_signature = sig["status"] not in {"UNKNOWN", None}
         if verify and has_signature and not sig["valid"]:

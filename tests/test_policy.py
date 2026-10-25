@@ -371,3 +371,19 @@ def test_init_dangling_config_symlink_does_not_create_target(tmp_path) -> None:
     with pytest.raises(PolicyError):
         cmd_init(argparse.Namespace(home=str(home), config=str(config)))
     assert not target.exists()
+
+
+def test_init_does_not_create_through_symlinked_ancestor(tmp_path) -> None:
+    import argparse
+
+    from gpg_mcp.__main__ import cmd_init
+
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    home = tmp_path / "gnupg"
+    config = link / "missing" / "config.toml"
+    with pytest.raises(PolicyError):
+        cmd_init(argparse.Namespace(home=str(home), config=str(config)))
+    assert not (real / "missing").exists()
