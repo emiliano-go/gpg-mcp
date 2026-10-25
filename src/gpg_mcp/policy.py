@@ -317,9 +317,12 @@ def _open_dir_secure(path: Path) -> int:
             os.close(dir_fd)
             dir_fd = next_fd
         return dir_fd
+    except FileNotFoundError:
+        os.close(dir_fd)
+        raise
     except OSError as exc:
         os.close(dir_fd)
-        raise PolicyError(f"cannot create secure directory: {exc}") from exc
+        raise PolicyError(f"cannot open secure directory: {exc}") from exc
     except BaseException:
         os.close(dir_fd)
         raise
