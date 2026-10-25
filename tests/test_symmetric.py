@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+import subprocess
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from gpg_mcp.errors import GpgMcpError
 from gpg_mcp.gpg import Gpg, GpgResult, StatusEvent
-from gpg_mcp.policy import get_policy
+from gpg_mcp.policy import get_policy, reset_policy_cache
+from gpg_mcp.server import reset_gpg
 
 
 def _runner() -> Gpg:
@@ -90,3 +95,83 @@ async def test_symmetric_decrypt_reports_good_signature(monkeypatch) -> None:
     assert result["plaintext"] == {"text": "sym plaintext"}
     assert result["signed"] is True
     assert result["signature"]["valid"] is True
+
+
+@pytest.fixture
+def symmetric_env(monkeypatch, keyring):
+    path = keyring.config.parent / "symmetric.toml"
+    path.write_text(
+        f'gnupg_home = "{keyring.home}"\n'
+        f'audit_log = "{keyring.home.parent / "audit-symmetric.jsonl"}"\n'
+        'approval = "none"\n'
+        "enable_symmetric = true\n"
+        "enable_network = false\n",
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o600)
+    monkeypatch.setenv("GPG_MCP_CONFIG", str(path))
+    reset_policy_cache()
+    reset_gpg()
+    yield
+    monkeypatch.undo()
+    reset_policy_cache()
+    reset_gpg()
+
+
+def _hybrid_ciphertext(keyring) -> str:
+    env = {
+        "GNUPGHOME": str(keyring.home),
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": "C",
+        "LANG": "C",
+        "HOME": os.environ.get("HOME", str(Path.home())),
+    }
+    proc = subprocess.run(
+        [
+            shutil.which("gpg"),
+            "--batch",
+            "--no-tty",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "testpass",
+            "--armor",
+            "--symmetric",
+            "--encrypt",
+            "--recipient",
+            keyring.fpr,
+        ],
+        input=b"hybrid plaintext",
+        env=env,
+        capture_output=True,
+        check=True,
+    )
+    return proc.stdout.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_symmetric_decrypt_rejects_hybrid_ciphertext(symmetric_env, keyring, connect) -> None:
+    ciphertext = _hybrid_ciphertext(keyring)
+    async with connect() as client:
+        result = await client.call_tool(
+            "symmetric_decrypt", {"ciphertext": ciphertext}
+        )
+        assert result.is_error
+        assert "symmetric-only" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_symmetric_approval_shows_verify(monkeypatch) -> None:
+    from gpg_mcp import server
+
+    captured: list[tuple[str, str]] = []
+
+    async def fake_request(op: str, summary: str):
+        captured.append((op, summary))
+        return server.Confirm(approve=True)
+
+    monkeypatch.setattr(server, "request", fake_request)
+    result = await server._ask_symmetric_decrypt(ciphertext="abc", verify=False)
+    assert result.approve is True
+    assert captured[0][0] == "symmetric_decrypt"
+    assert "Verify embedded signature: False" in captured[0][1]

@@ -263,6 +263,48 @@ def assert_config_file(path: Path) -> None:
         raise PolicyError("config file must not be group/world writable")
 
 
+def assert_config_parent(path: Path) -> None:
+    """Reject a config parent another user could modify."""
+    parent = path.parent
+    try:
+        st = parent.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode):
+        raise PolicyError("config parent must not be a symlink")
+    if not stat.S_ISDIR(st.st_mode):
+        raise PolicyError("config parent must be a directory")
+    if st.st_uid != os.getuid():
+        raise PolicyError("config parent must be owned by the current user")
+    if stat.S_IMODE(st.st_mode) & 0o022:
+        raise PolicyError("config parent must not be group/world writable")
+
+
+def read_config_file(path: Path) -> dict[str, Any]:
+    """Open and parse the config without a validation/open race."""
+    try:
+        fd = os.open(
+            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise PolicyError(f"cannot open config file: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PolicyError("config file must be a regular file")
+        if st.st_uid != os.getuid():
+            raise PolicyError("config file must be owned by the current user")
+        if stat.S_IMODE(st.st_mode) & 0o022:
+            raise PolicyError("config file must not be group/world writable")
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            raw = tomllib.load(fh)
+        return raw if isinstance(raw, dict) else {}
+    finally:
+        os.close(fd)
+
+
 def assert_production_policy(policy: Policy) -> None:
     """Refuse approval='none' at serve time unless explicitly opted in."""
     if policy.approval != "none":
@@ -286,12 +328,9 @@ def load_policy(path: Path | None = None, *, env: dict[str, str] | None = None) 
         os.path.expanduser(env.get("GPG_MCP_CONFIG", str(path or DEFAULT_CONFIG)))
     )
     raw: dict[str, Any] = {}
-    if config_path.exists():
-        assert_config_file(config_path)
-        with config_path.open("rb") as fh:
-            raw = tomllib.load(fh)
-        if not isinstance(raw, dict):
-            raise InputError("config root must be a table")
+    if config_path.exists() or config_path.is_symlink():
+        assert_config_parent(config_path)
+        raw = read_config_file(config_path)
         unknown = set(raw) - KNOWN_CONFIG_KEYS
         if unknown:
             raise InputError(f"unknown config keys: {sorted(unknown)}")
@@ -497,7 +536,15 @@ def decode_payload(data: str | None, data_base64: str | None, *, limit: int) -> 
     if data is not None:
         if len(data) > limit:
             raise InputError(f"payload exceeds the {limit} byte limit")
-        payload = data.encode("utf-8")
+        chunks: list[bytes] = []
+        total = 0
+        for start in range(0, len(data), 4096):
+            chunk = data[start : start + 4096].encode("utf-8")
+            total += len(chunk)
+            if total > limit:
+                raise InputError(f"payload exceeds the {limit} byte limit")
+            chunks.append(chunk)
+        payload = b"".join(chunks)
     else:
         encoded = data_base64 or ""
         if len(encoded) > (limit * 4 // 3) + 4:
@@ -572,17 +619,29 @@ def assert_recipient_allowed(policy: Policy, fingerprint: str) -> str:
     return fpr
 
 
-def _audit_failure(policy: Policy, message: str) -> None:
+def _audit_failure(policy: Policy, message: str, phase: str) -> None:
     if policy.audit_required:
-        raise AuditError(f"audit log unavailable: {message}")
-    print(f"gpg-mcp: audit log unavailable: {message}", file=sys.stderr)
+        raise AuditError(
+            f"audit log unavailable ({phase}): {message}",
+            data={
+                "phase": phase,
+                "operation_may_have_completed": phase == "outcome",
+            },
+        )
+    print(f"gpg-mcp: audit log unavailable ({phase}): {message}", file=sys.stderr)
 
 
-def audit(policy: Policy, record: dict[str, Any]) -> None:
-    """Append one JSON line to the audit ledger. Never contains secrets."""
+def audit(policy: Policy, record: dict[str, Any], *, phase: str = "outcome") -> None:
+    """Append one JSON line to the audit ledger. Never contains secrets.
+
+    ``phase`` distinguishes a pre-execution intent/approval record from a
+    post-execution outcome record. An outcome failure is reported explicitly
+    because the cryptographic operation may already have happened.
+    """
     entry = {
         "ts": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "home": str(policy.gnupg_home),
+        "phase": phase,
         **record,
     }
     line = json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n"
@@ -604,22 +663,28 @@ def audit(policy: Policy, record: dict[str, Any]) -> None:
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
-                _audit_failure(policy, "not a regular file")
+                _audit_failure(policy, "not a regular file", phase)
                 return
             if st.st_uid != os.getuid():
-                _audit_failure(policy, "not owned by the current user")
+                _audit_failure(policy, "not owned by the current user", phase)
                 return
             if stat.S_IMODE(st.st_mode) & 0o077:
                 try:
                     os.fchmod(fd, 0o600)
                 except OSError as exc:
-                    _audit_failure(policy, f"cannot tighten permissions: {exc}")
+                    _audit_failure(policy, f"cannot tighten permissions: {exc}", phase)
                     return
-            os.write(fd, line.encode("utf-8"))
+            payload = line.encode("utf-8")
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("short write to audit log")
+                view = view[written:]
         finally:
             os.close(fd)
     except OSError as exc:  # pragma: no cover - depends on host
-        _audit_failure(policy, str(exc))
+        _audit_failure(policy, str(exc), phase)
 
 
 def assert_manage_key_allowed(policy: Policy, fingerprint: str) -> str:

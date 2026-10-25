@@ -15,6 +15,7 @@ from .policy import (
     DEFAULT_CONFIG,
     DEFAULT_GNUPG_HOME,
     assert_config_file,
+    assert_config_parent,
     assert_keyring_permissions,
     assert_production_policy,
     get_policy,
@@ -87,6 +88,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             "not changing its permissions",
             file=sys.stderr,
         )
+    assert_config_parent(config)
     assert_config_file(config)
     print(f"keyring: {home}")
     print(f"config:  {config}")

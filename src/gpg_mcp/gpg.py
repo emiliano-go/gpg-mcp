@@ -40,6 +40,7 @@ from .errors import (
 from .policy import (
     Policy,
     assert_config_file,
+    assert_config_parent,
     assert_decrypt_key_allowed,
     assert_keyring_permissions,
     assert_manage_key_allowed,
@@ -432,14 +433,9 @@ def _worst_signature_status(results: list[dict[str, Any]]) -> str:
     return "UNKNOWN"
 
 
-def _verification(status: list[StatusEvent]) -> dict[str, Any]:
-    """Aggregate one result per NEWSIG sequence, failing closed across all.
-
-    A message can carry multiple signatures. An invalid signature must not be
-    hidden by a later valid one, so the aggregate is acceptable only when every
-    signature is policy-acceptable.
-    """
-    results = [_verify_one(sequence) for sequence in _signature_sequences(status)]
+def _aggregate_verification_results(
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
     if not results:
         return _verify_one([])
     aggregate = dict(results[0])
@@ -461,6 +457,17 @@ def _verification(status: list[StatusEvent]) -> dict[str, Any]:
         aggregate[flag] = any(result[flag] for result in results)
     aggregate["status"] = _worst_signature_status(results)
     return aggregate
+
+
+def _verification(status: list[StatusEvent]) -> dict[str, Any]:
+    """Aggregate one result per NEWSIG sequence, failing closed across all.
+
+    A message can carry multiple signatures. An invalid signature must not be
+    hidden by a later valid one, so the aggregate is acceptable only when every
+    signature is policy-acceptable.
+    """
+    results = [_verify_one(sequence) for sequence in _signature_sequences(status)]
+    return _aggregate_verification_results(results)
 
 
 def import_result(result: GpgResult, summary: dict[str, Any]) -> dict[str, Any]:
@@ -813,6 +820,7 @@ class Gpg:
         checks["gpg"] = {"path": self.gpg, "ok": bool(self.gpg)}
         checks["gpgconf"] = {"path": self.gpgconf, "ok": bool(self.gpgconf)}
         try:
+            assert_config_parent(self.policy.config_path)
             assert_config_file(self.policy.config_path)
             checks["config"] = {"path": str(self.policy.config_path), "ok": True}
         except Exception as exc:  # noqa: BLE001
@@ -928,6 +936,54 @@ class Gpg:
 
     # -- verify -------------------------------------------------------------
 
+    async def _signature_packets(self, signature: bytes) -> list[bytes]:
+        """Split a detached signature into individual signature packets."""
+        data = signature
+        if data.lstrip().startswith(b"-----BEGIN PGP SIGNATURE-----"):
+            dearmored = await self.run(
+                ["--dearmor"], input_data=data, check=False, use_status=False
+            )
+            if dearmored.returncode != 0 or not dearmored.stdout:
+                return [signature]
+            data = dearmored.stdout
+        listing = await self.run(
+            ["--list-packets"], input_data=data, check=False, use_status=False
+        )
+        offsets = sorted(
+            {
+                int(match.group(1))
+                for line in listing.text.splitlines()
+                if (match := re.match(r"# off=(\d+) ctb=\S+ tag=2\b", line))
+            }
+        )
+        if len(offsets) <= 1:
+            return [data]
+        return [
+            data[start : offsets[index + 1] if index + 1 < len(offsets) else len(data)]
+            for index, start in enumerate(offsets)
+        ]
+
+    async def _verify_detached_individually(
+        self, data: bytes, signature: bytes
+    ) -> dict[str, Any]:
+        results: list[dict[str, Any]] = []
+        codes: list[int] = []
+        for packet in await self._signature_packets(signature):
+            result = await self.run(
+                ["--verify", f"{_TMP}/sig", "-"],
+                input_data=data,
+                files={"sig": packet},
+                check=False,
+            )
+            results.append(_verify_one(result.status))
+            codes.append(result.returncode)
+        aggregate = _aggregate_verification_results(results)
+        aggregate["gpg_exit_code"] = next((code for code in codes if code != 0), 0)
+        if aggregate["gpg_exit_code"] != 0:
+            aggregate["policy_acceptable"] = False
+            aggregate["valid"] = False
+        return aggregate
+
     async def verify(
         self,
         data: bytes,
@@ -938,11 +994,16 @@ class Gpg:
         if mode not in {"detached", "cleartext", "inline"}:
             raise InputError("mode must be detached, cleartext or inline")
         args: list[str] = []
-        if await self._supports_proc_all_sigs():
+        supports_all = await self._supports_proc_all_sigs()
+        if supports_all:
             args.append("--proc-all-sigs")
         if mode == "detached":
             if signature is None:
                 raise InputError("signature is required for detached verification")
+            if not supports_all:
+                info = await self._verify_detached_individually(data, signature)
+                info["mode"] = mode
+                return info
             result = await self.run(
                 [*args, "--verify", f"{_TMP}/sig", "-"],
                 input_data=data,
@@ -1262,6 +1323,11 @@ class Gpg:
         preflight = await self.inspect_recipients(ciphertext)
         if not preflight["symmetric"]:
             raise GpgMcpError("input is not a symmetrically encrypted message", code="not_symmetric")
+        if preflight["public_key_ids"]:
+            raise PolicyError(
+                "symmetric_decrypt requires symmetric-only ciphertext; "
+                "use decrypt for hybrid public-key/symmetric messages"
+            )
         result = await self.run(
             ["--decrypt", "--no-symkey-cache"], input_data=ciphertext, check=False
         )

@@ -123,3 +123,31 @@ def test_audit_required_raises_on_unsafe_file(tmp_path) -> None:
     with pytest.raises(AuditError):
         audit(policy, {"event": "test"})
     reset_policy_cache()
+
+
+def test_audit_handles_short_writes(tmp_path, monkeypatch) -> None:
+    parent = tmp_path / "short-writes"
+    parent.mkdir()
+    log = parent / "audit.jsonl"
+    policy = _policy(tmp_path, str(log))
+    real_write = os.write
+    monkeypatch.setattr(
+        os, "write", lambda fd, data: real_write(fd, bytes(data[:1]))
+    )
+    audit(policy, {"event": "test"})
+    text = log.read_text(encoding="utf-8")
+    assert '"event": "test"' in text
+    reset_policy_cache()
+
+
+def test_audit_outcome_failure_is_explicit(tmp_path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("keep", encoding="utf-8")
+    link = tmp_path / "audit.jsonl"
+    link.symlink_to(target)
+    policy = _policy(tmp_path, str(link), audit_required=True)
+    with pytest.raises(AuditError) as exc:
+        audit(policy, {"event": "operation"}, phase="outcome")
+    assert "outcome" in str(exc.value)
+    assert exc.value.data.get("operation_may_have_completed") is True
+    reset_policy_cache()

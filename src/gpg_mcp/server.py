@@ -86,7 +86,11 @@ def _decode(data: str | None, data_base64: str | None) -> bytes:
 
 
 def _audit(tool: str, **fields: Any) -> None:
-    audit(get_policy(), {"event": "operation", "tool": tool, **fields})
+    audit(
+        get_policy(),
+        {"event": "operation", "tool": tool, **fields},
+        phase="outcome",
+    )
 
 
 def _hash(data: bytes) -> str:
@@ -223,14 +227,20 @@ async def _ask_symmetric_encrypt(
 
 
 async def _ask_symmetric_decrypt(
-    ciphertext: str | None = None, ciphertext_base64: str | None = None,
+    ciphertext: str | None = None,
+    ciphertext_base64: str | None = None,
+    verify: bool = True,
     ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
     payload = _decode(ciphertext, ciphertext_base64)
     return await request(
         "symmetric_decrypt",
-        payload_summary("symmetrically decrypt data", payload),
+        payload_summary(
+            "symmetrically decrypt data",
+            payload,
+            extra=f"Verify embedded signature: {verify}\nPlaintext will be returned.",
+        ),
     )
 
 

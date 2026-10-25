@@ -299,3 +299,28 @@ def test_decode_payload_limits_before_allocation() -> None:
     encoded = base64.b64encode(b"x" * 20).decode("ascii")
     with pytest.raises(InputError):
         decode_payload(None, encoded, limit=10)
+
+
+def test_config_dangling_symlink_is_rejected(tmp_path) -> None:
+    link = tmp_path / "config.toml"
+    link.symlink_to(tmp_path / "does-not-exist")
+    reset_policy_cache()
+    with pytest.raises(PolicyError):
+        load_policy(link, env={})
+
+
+def test_unsafe_config_parent_is_rejected(tmp_path) -> None:
+    parent = tmp_path / "unsafe"
+    parent.mkdir()
+    os.chmod(parent, 0o777)
+    config = parent / "config.toml"
+    config.write_text(f'gnupg_home = "{tmp_path}"\n', encoding="utf-8")
+    os.chmod(config, 0o600)
+    reset_policy_cache()
+    with pytest.raises(PolicyError):
+        load_policy(config, env={})
+
+
+def test_utf8_input_limit_is_enforced_before_large_allocation() -> None:
+    with pytest.raises(InputError):
+        decode_payload("\U0001F600" * 10, None, limit=10)

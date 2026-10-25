@@ -193,6 +193,7 @@ def _audit_approval(policy: Any, ops: list[str], decision: str, *, destructive: 
             "decision": decision,
             "destructive": destructive,
         },
+        phase="approval",
     )
 
 
@@ -330,6 +331,7 @@ def record_decision(
             "fingerprint": fingerprint,
             **extra,
         },
+        phase="intent",
     )
 
 

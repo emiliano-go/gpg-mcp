@@ -246,3 +246,54 @@ async def test_multiple_embedded_signatures_fail_closed(connect, keyring) -> Non
         assert result["signature_count"] == 2
         assert result["valid"] is False
         assert result["status"] == "BADSIG"
+
+
+@pytest.mark.asyncio
+async def test_multiple_signatures_individual_fallback(connect, keyring, monkeypatch) -> None:
+    from gpg_mcp.server import gpg
+
+    async with connect() as client:
+
+        async def raw_sign(data: str, signer: str) -> bytes:
+            result = await call(
+                client, "sign", data=data, signer=signer, armor=False
+            )
+            return base64.b64decode(result.structured_content["signature"]["data_base64"])
+
+        good = await raw_sign("multi", keyring.fpr)
+        bad = await raw_sign("different", keyring.fpr2)
+
+        runner = gpg()
+
+        async def no_proc_all() -> bool:
+            return False
+
+        monkeypatch.setattr(runner, "_supports_proc_all_sigs", no_proc_all)
+
+        bad_first = base64.b64encode(bad + good).decode("ascii")
+        result = ok(
+            await call(
+                client,
+                "verify",
+                data="multi",
+                signature_base64=bad_first,
+                mode="detached",
+            )
+        )
+        assert result["signature_count"] == 2
+        assert result["valid"] is False
+        assert result["status"] == "BADSIG"
+
+        good_first = base64.b64encode(good + bad).decode("ascii")
+        result = ok(
+            await call(
+                client,
+                "verify",
+                data="multi",
+                signature_base64=good_first,
+                mode="detached",
+            )
+        )
+        assert result["signature_count"] == 2
+        assert result["valid"] is False
+        assert result["status"] == "BADSIG"

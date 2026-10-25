@@ -51,9 +51,15 @@ The same-user limitation is intentional and documented in the README.
 
 ## Audit and failure behavior
 
-`audit_required = true` (the default) makes a failed audit write fail the operation. An existing
-audit file that is not a regular file, is owned by another user, or cannot be tightened to `0600`
-causes the operation to fail. Set `audit_required = false` only for disposable test keyrings.
+`audit_required = true` (the default) makes a failed audit write fail the operation. Records are
+phased: approval/intent before execution and outcome after. An outcome failure is reported explicitly
+as "the operation may have completed" and is never retried. An existing audit file that is not a
+regular file, is owned by another user, or cannot be tightened to `0600` causes the operation to
+fail. Set `audit_required = false` only for disposable test keyrings.
+
+The config is opened with `O_NOFOLLOW` and validated through `fstat`; its parent must be a user-owned
+directory that is not group/world-writable. Symmetric decryption is restricted to symmetric-only
+ciphertext so hybrid messages cannot bypass the public-key allow-list.
 
 ## Platform support
 
