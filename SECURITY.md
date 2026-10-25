@@ -60,12 +60,17 @@ fail. Set `audit_required = false` only for disposable test keyrings.
 The config path is walked with directory file descriptors and `O_NOFOLLOW`, and the opened file is
 validated through `fstat`; ancestors must be owned by the user or root and must not be group/world
 writable without the sticky bit. `init` creates the config with exclusive/no-follow semantics, refuses a symlinked
-`gpg-agent.conf`, and cannot write through a dangling config symlink. The audit ledger uses the same
-directory-fd walk, so an unsafe ancestor cannot redirect or replace it.
+`gpg-agent.conf`, and cannot write through a dangling config symlink. Config, keyring and audit
+directories are created incrementally relative to validated directory descriptors; a symlinked or
+otherwise unsafe ancestor is rejected before anything is created through it. The audit ledger uses
+the same directory-fd walk, so an unsafe ancestor cannot redirect or replace it.
 
-Symmetric decryption is restricted to symmetric-only ciphertext. `decrypt` rejects symmetric-only
-ciphertext and, for hybrid ciphertext, requires GnuPG to report an actual allow-listed public key;
-it never falls back to the symmetric route. Only the recoverable symmetric-passphrase failure is
+Symmetric decryption is restricted to symmetric-only ciphertext and applies the same strict status
+policy: `DECRYPTION_OKAY` is required, generic errors/failures and bad integrity checks are fatal,
+and an unexplained nonzero exit is rejected. With `verify=false`, only an explicitly recognized
+embedded-signature failure may explain a nonzero exit. `decrypt` rejects symmetric-only ciphertext
+and, for hybrid ciphertext, requires GnuPG to report an actual allow-listed public key; it never
+falls back to the symmetric route. Only the recoverable symmetric-passphrase failure is
 tolerated for hybrid input, and only alongside a successful public-key decryption. Generic errors,
 failures, and unexplained nonzero exit codes are fatal. A custom policy that gates only
 `symmetric_decrypt` therefore cannot be bypassed through `decrypt`.

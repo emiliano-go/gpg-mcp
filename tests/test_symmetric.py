@@ -273,3 +273,107 @@ async def test_custom_policy_cannot_bypass_symmetric_approval(
     finally:
         reset_policy_cache()
         reset_gpg()
+
+
+def test_symmetric_decryption_status_policy() -> None:
+    from gpg_mcp.gpg import StatusEvent, symmetric_decryption_status_ok
+
+    def events(*items):
+        return [StatusEvent(keyword, args, "") for keyword, args in items]
+
+    assert symmetric_decryption_status_ok(
+        events(("DECRYPTION_OKAY", [])), 0, verify=True
+    ) is True
+    assert symmetric_decryption_status_ok(
+        events(("DECRYPTION_OKAY", []), ("DECRYPTION_FAILED", [])), 0, verify=True
+    ) is False
+    assert symmetric_decryption_status_ok(
+        events(("DECRYPTION_OKAY", []), ("BADMDC", [])), 0, verify=True
+    ) is False
+    assert symmetric_decryption_status_ok(
+        events(("DECRYPTION_OKAY", []), ("ERROR", ["get_passphrase"])), 0, verify=True
+    ) is False
+    assert symmetric_decryption_status_ok(
+        events(("DECRYPTION_OKAY", [])), 2, verify=True
+    ) is False
+    assert symmetric_decryption_status_ok(
+        events(
+            ("DECRYPTION_OKAY", []),
+            ("BADSIG", ["KEYID", "uid"]),
+            ("FAILURE", ["gpg-exit"]),
+        ),
+        2,
+        verify=False,
+    ) is True
+    assert symmetric_decryption_status_ok(
+        events(
+            ("DECRYPTION_OKAY", []),
+            ("BADSIG", ["KEYID", "uid"]),
+            ("FAILURE", ["gpg-exit"]),
+        ),
+        2,
+        verify=True,
+    ) is False
+    assert symmetric_decryption_status_ok(
+        events(("DECRYPTION_OKAY", []), ("FAILURE", ["gpg-exit"])),
+        2,
+        verify=False,
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_symmetric_decrypt_rejects_unexplained_nonzero(monkeypatch) -> None:
+    runner = _runner()
+
+    async def fake_inspect(_ciphertext):
+        return {"symmetric": True, "public_key_ids": [], "encrypted": True}
+
+    async def fake_run(*_args, **_kwargs):
+        return GpgResult(
+            argv=[],
+            returncode=2,
+            stdout=b"plaintext",
+            stderr="",
+            status=[StatusEvent("DECRYPTION_OKAY", [], "")],
+        )
+
+    monkeypatch.setattr(runner, "inspect_recipients", fake_inspect)
+    monkeypatch.setattr(runner, "run", fake_run)
+    with pytest.raises(GpgMcpError) as exc:
+        await runner.symmetric_decrypt(b"ciphertext")
+    assert "exited with status 2" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_symmetric_decrypt_verify_false_allows_recognized_signature_failure(
+    monkeypatch,
+) -> None:
+    runner = _runner()
+
+    async def fake_inspect(_ciphertext):
+        return {"symmetric": True, "public_key_ids": [], "encrypted": True}
+
+    async def fake_run(*_args, **_kwargs):
+        return GpgResult(
+            argv=[],
+            returncode=2,
+            stdout=b"plaintext",
+            stderr="",
+            status=[
+                StatusEvent("DECRYPTION_OKAY", [], ""),
+                StatusEvent("NEWSIG", [], ""),
+                StatusEvent("BADSIG", ["KEYID", "uid"], ""),
+                StatusEvent("FAILURE", ["gpg-exit"], ""),
+            ],
+        )
+
+    monkeypatch.setattr(runner, "inspect_recipients", fake_inspect)
+    monkeypatch.setattr(runner, "run", fake_run)
+    result = await runner.symmetric_decrypt(b"ciphertext", verify=False)
+    assert result["plaintext"] == {"text": "plaintext"}
+    assert result["signed"] is True
+    assert result["signature"]["valid"] is False
+
+    with pytest.raises(GpgMcpError) as exc:
+        await runner.symmetric_decrypt(b"ciphertext", verify=True)
+    assert exc.value.code == "gpg_failed"

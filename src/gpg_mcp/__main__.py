@@ -18,7 +18,7 @@ from .policy import (
     assert_config_file,
     assert_keyring_permissions,
     assert_production_policy,
-    assert_secure_ancestors,
+    ensure_secure_dir,
     get_policy,
     load_policy,
 )
@@ -69,8 +69,9 @@ def _set_env(config: str | None, home: str | None) -> None:
 def cmd_init(args: argparse.Namespace) -> int:
     home = Path(os.path.expanduser(args.home or str(DEFAULT_GNUPG_HOME))).resolve()
     config = Path(os.path.expanduser(args.config or str(DEFAULT_CONFIG))).absolute()
-    home.mkdir(parents=True, exist_ok=True)
-    os.chmod(home, 0o700)
+    home_fd = ensure_secure_dir(home)
+    os.fchmod(home_fd, 0o700)
+    os.close(home_fd)
     agent_conf = home / "gpg-agent.conf"
     try:
         agent_st = agent_conf.lstat()
@@ -91,10 +92,8 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "gpg-agent.conf must be a regular file owned by the current user"
             )
         os.chmod(agent_conf, 0o600)
-    if not config.parent.exists():
-        config.parent.mkdir(parents=True, mode=0o700)
-        os.chmod(config.parent, 0o700)
-    assert_secure_ancestors(config.parent)
+    config_dir_fd = ensure_secure_dir(config.parent)
+    os.close(config_dir_fd)
     try:
         config_st = config.lstat()
     except FileNotFoundError:

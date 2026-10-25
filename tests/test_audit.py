@@ -165,3 +165,16 @@ def test_audit_rejects_non_sticky_writable_ancestor(tmp_path) -> None:
         audit(policy, {"event": "test"})
     assert not log.exists()
     reset_policy_cache()
+
+
+def test_audit_does_not_create_through_symlinked_ancestor(tmp_path) -> None:
+    real = tmp_path / "real-audit"
+    real.mkdir()
+    link = tmp_path / "link-audit"
+    link.symlink_to(real, target_is_directory=True)
+    log = link / "missing" / "audit.jsonl"
+    policy = _policy(tmp_path, str(log), audit_required=True)
+    with pytest.raises(AuditError):
+        audit(policy, {"event": "test"})
+    assert not (real / "missing").exists()
+    reset_policy_cache()
