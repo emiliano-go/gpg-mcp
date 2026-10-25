@@ -13,7 +13,7 @@ import hashlib
 from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
-from mcp.server.mcpserver import Elicit, ElicitationResult, Resolve
+from mcp.server.mcpserver import Context, Elicit, ElicitationResult, Resolve
 from mcp.types import ToolAnnotations
 
 from .approval import (
@@ -27,6 +27,7 @@ from .approval import (
     request_all,
     request_destructive,
     require_approved,
+    set_approval_context,
 )
 from .gpg import Gpg
 from .policy import (
@@ -109,7 +110,9 @@ async def _ask_sign(
     mode: str = "detached",
     armor: bool = True,
     hash_algo: str = "SHA256",
+    ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     payload = _decode(data, data_base64)
     return await request(
         "sign",
@@ -128,7 +131,9 @@ async def _ask_encrypt(
     recipients: list[str] | None = None,
     sign_with: str | None = None,
     armor: bool = True,
+    ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     payload = _decode(data, data_base64)
     recipient_labels = [await _key_label(recipient) for recipient in (recipients or [])]
     recipient_text = "\n".join(f"- {label}" for label in recipient_labels) or "- none"
@@ -153,7 +158,9 @@ async def _ask_sign_and_encrypt(
     recipients: list[str] | None = None,
     signer: str = "",
     armor: bool = True,
+    ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     payload = _decode(data, data_base64)
     recipient_labels = [await _key_label(recipient) for recipient in (recipients or [])]
     recipient_text = "\n".join(f"- {label}" for label in recipient_labels) or "- none"
@@ -173,7 +180,9 @@ async def _ask_decrypt(
     ciphertext_base64: str | None = None,
     verify: bool = True,
     expected_key: str | None = None,
+    ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     payload = _decode(ciphertext, ciphertext_base64)
     label = await _key_label(expected_key) if expected_key else "auto"
     return await request(
@@ -188,8 +197,10 @@ async def _ask_decrypt(
 
 
 async def _ask_symmetric_encrypt(
-    data: str | None = None, data_base64: str | None = None, armor: bool = True
+    data: str | None = None, data_base64: str | None = None, armor: bool = True,
+    ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     payload = _decode(data, data_base64)
     return await request(
         "symmetric_encrypt",
@@ -198,8 +209,10 @@ async def _ask_symmetric_encrypt(
 
 
 async def _ask_symmetric_decrypt(
-    ciphertext: str | None = None, ciphertext_base64: str | None = None
+    ciphertext: str | None = None, ciphertext_base64: str | None = None,
+    ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     payload = _decode(ciphertext, ciphertext_base64)
     return await request(
         "symmetric_decrypt",
@@ -213,7 +226,9 @@ async def _ask_create_key(
     expire: str = "2y",
     protect: bool = True,
     subkey_algo: str = "cv25519",
+    ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     warning = "" if protect else "\nWARNING: the new key will have NO passphrase."
     return await request(
         "create_key",
@@ -223,8 +238,10 @@ async def _ask_create_key(
 
 
 async def _ask_add_subkey(
-    fingerprint: str = "", algo: str = "cv25519", expire: str = "2y", usage: str = "default"
+    fingerprint: str = "", algo: str = "cv25519", expire: str = "2y", usage: str = "default",
+    ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     return await request(
         "add_subkey",
         f"gpg-mcp wants to add a subkey.\nFingerprint: {fingerprint}\n"
@@ -232,15 +249,18 @@ async def _ask_add_subkey(
     )
 
 
-async def _ask_add_uid(fingerprint: str = "", uid: str = "") -> Confirm | Elicit[Confirm]:
+async def _ask_add_uid(fingerprint: str = "", uid: str = "", ctx: Context | None = None) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     return await request(
         "add_uid", f"gpg-mcp wants to add a UID.\nFingerprint: {fingerprint}\nUID: {uid}"
     )
 
 
 async def _ask_set_expiry(
-    fingerprint: str = "", expire: str = "", subkeys: bool = False
+    fingerprint: str = "", expire: str = "", subkeys: bool = False,
+    ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     return await request(
         "set_expiry",
         f"gpg-mcp wants to change key expiry.\nFingerprint: {fingerprint}\n"
@@ -248,7 +268,8 @@ async def _ask_set_expiry(
     )
 
 
-async def _ask_change_passphrase(fingerprint: str = "") -> Confirm | Elicit[Confirm]:
+async def _ask_change_passphrase(fingerprint: str = "", ctx: Context | None = None) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     return await request(
         "change_passphrase",
         f"gpg-mcp wants to change the passphrase for {fingerprint}.\n"
@@ -257,8 +278,10 @@ async def _ask_change_passphrase(fingerprint: str = "") -> Confirm | Elicit[Conf
 
 
 async def _ask_import_public_key(
-    key: str | None = None, key_base64: str | None = None, allow_secret: bool = False
+    key: str | None = None, key_base64: str | None = None, allow_secret: bool = False,
+    ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     payload = _decode(key, key_base64)
     return await request(
         "import_public_key",
@@ -270,14 +293,18 @@ async def _ask_import_public_key(
     )
 
 
-async def _ask_set_ownertrust(fingerprint: str = "", level: str = "") -> Confirm | Elicit[Confirm]:
+async def _ask_set_ownertrust(
+    fingerprint: str = "", level: str = "", ctx: Context | None = None
+) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     return await request(
         "set_ownertrust",
         f"gpg-mcp wants to set ownertrust.\nFingerprint: {fingerprint}\nLevel: {level}",
     )
 
 
-async def _ask_generate_revocation(fingerprint: str = "") -> Confirm | Elicit[Confirm]:
+async def _ask_generate_revocation(fingerprint: str = "", ctx: Context | None = None) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     fpr = require_fingerprint(fingerprint)
     return await request(
         "generate_revocation",
@@ -286,7 +313,8 @@ async def _ask_generate_revocation(fingerprint: str = "") -> Confirm | Elicit[Co
     )
 
 
-async def _ask_send_key(fingerprint: str = "") -> Confirm | Elicit[Confirm]:
+async def _ask_send_key(fingerprint: str = "", ctx: Context | None = None) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
     policy = get_policy()
     return await request(
         "send_key",
@@ -296,8 +324,10 @@ async def _ask_send_key(fingerprint: str = "") -> Confirm | Elicit[Confirm]:
 
 
 async def _ask_delete_key(
-    fingerprint: str = "", secret: bool = False
+    fingerprint: str = "", secret: bool = False,
+    ctx: Context | None = None,
 ) -> DestructiveConfirm | Elicit[DestructiveConfirm]:
+    set_approval_context(ctx)
     fpr = fingerprint.strip().upper()
     what = "the SECRET and public key" if secret else "the public key"
     return await request_destructive(
@@ -308,7 +338,10 @@ async def _ask_delete_key(
     )
 
 
-async def _ask_revoke_key(fingerprint: str = "") -> DestructiveConfirm | Elicit[DestructiveConfirm]:
+async def _ask_revoke_key(
+    fingerprint: str = "", ctx: Context | None = None
+) -> DestructiveConfirm | Elicit[DestructiveConfirm]:
+    set_approval_context(ctx)
     fpr = require_fingerprint(fingerprint)
     return await request_destructive(
         "revoke_key",
@@ -322,7 +355,9 @@ async def _ask_import_revocation(
     certificate_base64: str | None = None,
     fingerprint: str = "",
     apply: bool = True,
+    ctx: Context | None = None,
 ) -> DestructiveConfirm | Elicit[DestructiveConfirm]:
+    set_approval_context(ctx)
     payload = _decode(certificate, certificate_base64)
     requested = require_fingerprint(fingerprint)
     validated = await gpg().inspect_revocation(

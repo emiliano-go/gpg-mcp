@@ -234,3 +234,66 @@ async def test_sign_and_encrypt_requires_encrypt_approval(composite_env, keyring
         )
         assert not result.is_error, result.content[0].text
     assert calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_client_without_elicitation_falls_back_to_local(
+    approval_env, monkeypatch
+) -> None:
+    from types import SimpleNamespace
+
+    from mcp.server.mcpserver import Elicit
+
+    from gpg_mcp.approval import (
+        Confirm,
+        request_all,
+        request_destructive,
+        set_approval_context,
+    )
+    from gpg_mcp.errors import GpgMcpError
+
+    fake_ctx = SimpleNamespace(
+        session=SimpleNamespace(
+            client_params=SimpleNamespace(
+                capabilities=SimpleNamespace(elicitation=None)
+            )
+        )
+    )
+
+    async def yes(_summary: str) -> bool:
+        return True
+
+    async def entry(_summary: str, _prompt: str) -> str:
+        return "ABCDEF12"
+
+    monkeypatch.setattr("gpg_mcp.approval._zenity", lambda: "/bin/true")
+    monkeypatch.setattr("gpg_mcp.approval._zenity_question", yes)
+    monkeypatch.setattr("gpg_mcp.approval._zenity_entry", entry)
+    set_approval_context(fake_ctx)
+    try:
+        decision = await request_all(["sign"], "fallback approval")
+        assert isinstance(decision, Confirm)
+        assert decision.approve is True
+
+        destructive = await request_destructive(
+            "delete_key", "delete", "A" * 32 + "ABCDEF12"
+        )
+        assert destructive.approve is True
+        assert destructive.confirmation == "ABCDEF12"
+
+        monkeypatch.setattr("gpg_mcp.approval._zenity", lambda: None)
+        with pytest.raises(GpgMcpError):
+            await request_all(["sign"], "no dialog")
+
+        capable = SimpleNamespace(
+            session=SimpleNamespace(
+                client_params=SimpleNamespace(
+                    capabilities=SimpleNamespace(elicitation=object())
+                )
+            )
+        )
+        set_approval_context(capable)
+        elicited = await request_all(["sign"], "elicit")
+        assert isinstance(elicited, Elicit)
+    finally:
+        set_approval_context(None)

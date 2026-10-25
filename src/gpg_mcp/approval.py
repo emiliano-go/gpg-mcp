@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +33,22 @@ from .policy import (
     get_policy,
     requires_approval,
 )
+
+_APPROVAL_CTX: ContextVar[Any | None] = ContextVar("gpg_mcp_approval_ctx", default=None)
+
+
+def set_approval_context(ctx: Any | None) -> None:
+    """Called by each resolver so approval can inspect client capabilities."""
+    _APPROVAL_CTX.set(ctx)
+
+
+def _client_can_elicit() -> bool:
+    ctx = _APPROVAL_CTX.get()
+    if ctx is None:
+        return False
+    params = getattr(getattr(ctx, "session", None), "client_params", None)
+    capabilities = getattr(params, "capabilities", None)
+    return bool(capabilities is not None and getattr(capabilities, "elicitation", None) is not None)
 
 
 class Confirm(BaseModel):
@@ -144,6 +161,15 @@ async def _zenity_entry(summary: str, prompt: str) -> str | None:
         return None
 
 
+def _require_local_approval_available() -> None:
+    if _zenity() is None:
+        raise GpgMcpError(
+            "the MCP client does not support elicitation and local approval is "
+            "unavailable; install zenity/run with a display, or set approval='local'",
+            code="approval_unavailable",
+        )
+
+
 def _required_operations(ops: list[str]) -> tuple[Any, list[str]]:
     """Resolve the operations that actually require approval.
 
@@ -182,6 +208,17 @@ async def request_all(ops: list[str], summary: str) -> Confirm | Elicit[Confirm]
         approved = await _zenity_question(summary)
         _audit_approval(policy, required, "local_accept" if approved else "local_decline")
         return Confirm(approve=approved)
+    if not _client_can_elicit():
+        # The client did not declare elicitation. Fall back to an OS dialog,
+        # which is independent of the MCP client and still a human gate.
+        _require_local_approval_available()
+        approved = await _zenity_question(summary)
+        _audit_approval(
+            policy,
+            required,
+            "local_fallback_accept" if approved else "local_fallback_decline",
+        )
+        return Confirm(approve=approved)
     return Elicit(summary, Confirm)
 
 
@@ -208,7 +245,10 @@ async def request_destructive(
     if policy.approval == "none":
         _audit_approval(policy, required, "skipped", destructive=True)
         return DestructiveConfirm(approve=True, confirmation=suffix)
-    if policy.approval == "local":
+    fallback = policy.approval != "local" and not _client_can_elicit()
+    if policy.approval == "local" or fallback:
+        if fallback:
+            _require_local_approval_available()
         approved = await _zenity_question(summary)
         typed = (
             await _zenity_entry(summary, f"Type the last 8 characters: {suffix}")
@@ -216,9 +256,10 @@ async def request_destructive(
             else None
         )
         ok = bool(approved and typed and typed.strip().upper() == suffix)
-        _audit_approval(
-            policy, required, "local_accept" if ok else "local_decline", destructive=True
+        decision = ("local_fallback_" if fallback else "local_") + (
+            "accept" if ok else "decline"
         )
+        _audit_approval(policy, required, decision, destructive=True)
         return DestructiveConfirm(approve=ok, confirmation=typed or "")
     return Elicit(
         f"{summary}\n\nThis is destructive. Type the last 8 characters of the "

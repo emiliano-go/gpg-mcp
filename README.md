@@ -298,8 +298,12 @@ Network (opt-in):
 
 The server asks the MCP client to show an approval form. The form includes the operation, full key
 fingerprints and identities, payload size, SHA-256 and a short preview. It is implemented as an MCP
-**resolver**, so it works with both legacy and current protocol versions. If the client did not
-declare elicitation support, the call fails closed.
+**resolver**, so it works with both legacy and current protocol versions.
+
+If the client did not declare elicitation support (for example, some CLI clients), the server falls
+back to the local `zenity` dialog. That is still a human gate and is independent of the MCP client.
+If neither elicitation nor a safe local dialog is available, the call fails closed with an
+`approval_unavailable` error; it never auto-approves.
 
 Composite operations require approval if any constituent requires it. `sign_and_encrypt` inherits
 both `sign` and `encrypt`; `encrypt(..., sign_with=...)` inherits `sign` as well. A custom
