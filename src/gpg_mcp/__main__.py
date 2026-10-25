@@ -67,7 +67,7 @@ def _set_env(config: str | None, home: str | None) -> None:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    home = Path(os.path.expanduser(args.home or str(DEFAULT_GNUPG_HOME))).resolve()
+    home = Path(os.path.expanduser(args.home or str(DEFAULT_GNUPG_HOME))).absolute()
     config = Path(os.path.expanduser(args.config or str(DEFAULT_CONFIG))).absolute()
     home_fd = ensure_secure_dir(home)
     os.fchmod(home_fd, 0o700)

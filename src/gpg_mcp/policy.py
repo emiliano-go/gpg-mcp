@@ -17,8 +17,8 @@ from urllib.parse import urlsplit
 
 from .errors import AuditError, InputError, PolicyError
 
-USER_GNUPG_HOME = (Path.home() / ".gnupg").resolve()
-DEFAULT_GNUPG_HOME = (Path.home() / ".local" / "share" / "gpg-mcp" / "gnupg").resolve()
+USER_GNUPG_HOME = (Path.home() / ".gnupg").absolute()
+DEFAULT_GNUPG_HOME = (Path.home() / ".local" / "share" / "gpg-mcp" / "gnupg").absolute()
 DEFAULT_CONFIG = Path.home() / ".config" / "gpg-mcp" / "config.toml"
 DEFAULT_AUDIT = Path.home() / ".local" / "share" / "gpg-mcp" / "audit.jsonl"
 
@@ -309,7 +309,11 @@ def _open_dir_secure(path: Path) -> int:
                 | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=dir_fd,
             )
-            _check_secure_dir(next_fd)
+            try:
+                _check_secure_dir(next_fd)
+            except BaseException:
+                os.close(next_fd)
+                raise
             os.close(dir_fd)
             dir_fd = next_fd
         return dir_fd
@@ -354,9 +358,13 @@ def ensure_secure_dir(path: Path) -> int:
                     dir_fd=dir_fd,
                 )
                 created = True
-            _check_secure_dir(next_fd)
-            if created:
-                os.fchmod(next_fd, 0o700)
+            try:
+                _check_secure_dir(next_fd)
+                if created:
+                    os.fchmod(next_fd, 0o700)
+            except BaseException:
+                os.close(next_fd)
+                raise
             os.close(dir_fd)
             dir_fd = next_fd
         return dir_fd
@@ -476,7 +484,7 @@ def load_policy(path: Path | None = None, *, env: dict[str, str] | None = None) 
         raise InputError(f"unknown operations in require_approval: {sorted(unknown)}")
 
     policy = Policy(
-        gnupg_home=home.resolve(),
+        gnupg_home=home.absolute(),
         allowed_sign_keys=_as_str_tuple(raw.get("allowed_sign_keys"), "allowed_sign_keys"),
         allowed_decrypt_keys=_as_str_tuple(
             raw.get("allowed_decrypt_keys"), "allowed_decrypt_keys"
@@ -691,11 +699,19 @@ def encode_payload(payload: bytes) -> dict[str, Any]:
 
 def assert_keyring_permissions(home: Path) -> None:
     try:
-        st = home.stat()
+        assert_secure_ancestors(home.parent)
     except FileNotFoundError as exc:
         raise PolicyError(
             f"GNUPGHOME does not exist: {home}. Run 'gpg-mcp init' first."
         ) from exc
+    try:
+        st = home.lstat()
+    except FileNotFoundError as exc:
+        raise PolicyError(
+            f"GNUPGHOME does not exist: {home}. Run 'gpg-mcp init' first."
+        ) from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise PolicyError("GNUPGHOME must not be a symlink")
     if not stat.S_ISDIR(st.st_mode):
         raise PolicyError(f"GNUPGHOME is not a directory: {home}")
     if st.st_uid != os.getuid():
