@@ -1,5 +1,7 @@
 # gpg-mcp
 
+<!-- mcp-name: io.github.emiliano-go/gpg-mcp -->
+
 A security-focused [Model Context Protocol](https://modelcontextprotocol.io) server for GnuPG.
 
 `gpg-mcp` lets an AI agent sign, verify, encrypt, decrypt and manage OpenPGP keys **without ever
@@ -211,7 +213,66 @@ unlocks the key only after pinentry succeeds.
 
 ---
 
-## Quick start
+## Install
+
+PyPI: `gpg-mcp`. MCP Registry: `io.github.emiliano-go/gpg-mcp`.
+
+Pin the version in client config so a restart does not change the server build.
+
+```bash
+# run without a global install
+uvx gpg-mcp@0.1.0 serve
+
+# or install a pinned CLI
+uv tool install gpg-mcp==0.1.0
+# or
+pipx install gpg-mcp==0.1.0
+# or
+pip install gpg-mcp==0.1.0
+```
+
+First run. If you did not install a CLI, prefix these with `uvx gpg-mcp@0.1.0`:
+
+```bash
+gpg-mcp init
+gpg-mcp doctor
+```
+
+MCP client config, with no global install:
+
+```json
+{
+  "mcpServers": {
+    "gpg": {
+      "command": "uvx",
+      "args": ["gpg-mcp@0.1.0", "serve"]
+    }
+  }
+}
+```
+
+If you installed with `uv tool` or `pipx`:
+
+```json
+{
+  "mcpServers": {
+    "gpg": {
+      "command": "gpg-mcp",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+Requirements: Python 3.11+, GnuPG 2.2+ (2.4 recommended), pinentry, and `zenity` when using
+`approval = "local"`. Linux and other Unix-like systems are supported; Windows is not.
+
+The registry entry is searchable at
+`https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.emiliano-go/gpg-mcp`.
+
+---
+
+## Quick start (from source)
 
 Requirements: Python 3.11+, GnuPG 2.2+ (2.4 recommended), a pinentry program.
 
