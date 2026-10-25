@@ -297,3 +297,24 @@ async def test_client_without_elicitation_falls_back_to_local(
         assert isinstance(elicited, Elicit)
     finally:
         set_approval_context(None)
+
+
+@pytest.mark.asyncio
+async def test_resolver_falls_back_without_client_capability(
+    approval_env, keyring, monkeypatch
+) -> None:
+    from mcp import Client
+
+    import gpg_mcp.approval as approval
+
+    async def yes(_summary: str) -> bool:
+        return True
+
+    monkeypatch.setattr(approval, "_zenity", lambda: "/bin/true")
+    monkeypatch.setattr(approval, "_zenity_question", yes)
+
+    async with Client(mcp) as client:
+        result = await call(
+            client, "sign", data="fallback via resolver", signer=keyring.fpr
+        )
+        assert not result.is_error, result.content[0].text if result.content else result
