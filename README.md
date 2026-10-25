@@ -75,8 +75,8 @@ fixed, typed surface with deliberate omissions:
     must be regular files, and must not be group/world writable. An unsafe `zenity` makes local
     approval fail closed instead of trusting a substituted dialog.
 13. **Bounded resources.** Input/output size caps, per-operation timeouts, a dedicated process
-    group killed on timeout, and a 0700 temporary directory with 0600 files. Status output that
-    exceeds `max_status_bytes` fails closed instead of being parsed partially.
+    group killed on timeout, and a 0700 temporary directory with 0600 files. Status output beyond
+    the effective status limit fails closed instead of being parsed partially.
 14. **The generic importer cannot revoke.** `import_public_key` rejects secret-key packets and any
     revocation signature, including revocation signatures embedded in key material. Revocations
     must use `import_revocation`, where the target is validated and typed confirmation is required.
@@ -137,7 +137,7 @@ sequence.
   `gpg-agent` socket, or edit `~/.config/gpg-mcp/config.toml`. If the agent has shell access, the
   MCP policy is not an OS boundary. Use [stronger isolation](#stronger-isolation).
 - **A malicious MCP client.** In `approval = "client"` mode, the client renders the approval
-  dialog. A malicious client can fake it. Use `approval = "local"` (zenity/TTY, independent of the
+  dialog. A malicious client can fake it. Use `approval = "local"` (zenity, independent of the
   client) or a separate user/hardware token.
 - **Compromised gpg or gpg-agent.** A compromised system binary can do anything. The binary checks
   reduce PATH hijacking, not supply-chain compromise.
@@ -150,7 +150,7 @@ sequence.
 |---|---|
 | Agent asks for the private key | No tool returns it; response guard blocks accidental output |
 | Agent tries `--export-secret-keys` | Option is never constructed; no raw exec |
-| Agent supplies an option as a UID/fingerprint | Full-fingerprint validation; UIDs go into a parameter file, not argv |
+| Agent supplies an option as a UID/fingerprint | Full-fingerprint validation; UIDs reject leading `-`/control characters, and key creation uses a parameter file |
 | Agent signs a malicious tag/release silently | Allow-list + approval showing key, size, SHA-256 and preview |
 | Agent decrypts stolen ciphertext | Allow-list + approval + recipient preflight |
 | Agent encrypts secrets to an attacker key | Named recipients in approval + optional `allowed_recipients` |
@@ -171,7 +171,7 @@ sequence.
 | A destructive operation is removed from `require_approval` | `destructive_confirmation` still demands the typed suffix by default |
 | A revocation certificate is submitted through the generic importer | Packet-level revocation-signature rejection; use `import_revocation` |
 | Decryption silently uses a non-allow-listed secret key | `DECRYPTION_KEY` status is checked; plaintext is discarded on mismatch |
-| A huge/incomplete status file is treated as success | `max_status_bytes` is enforced; partial status fails closed |
+| A huge/incomplete status file is treated as success | The effective status limit is enforced; partial status fails closed |
 | A hybrid message routes symmetric decryption around the key allow-list | `symmetric_decrypt` rejects public-key recipients; `decrypt` requires a reported allow-listed public key |
 | Symmetric-only input uses the less-restricted `decrypt` approval | `decrypt` rejects symmetric-only ciphertext before execution |
 | An older GnuPG stops at the first bad signature | Detached packets are verified individually and aggregated fail-closed |
@@ -200,7 +200,7 @@ MCP client (agent)
 gpg-mcp (Python, mcp SDK v2)
    │  fixed argv, stdin/stdout, --status-file
    ▼
-gpg 2.4 ──► gpg-agent ──► pinentry (human passphrase)
+gpg 2.2+ (2.4 shown) ──► gpg-agent ──► pinentry (human passphrase)
    │
    ▼
 GNUPGHOME (encrypted private keys + public keyring)
@@ -283,7 +283,7 @@ Config path: `~/.config/gpg-mcp/config.toml`, or `--config`, or `GPG_MCP_CONFIG`
 | Key | Default | Meaning |
 |---|---|---|
 | `gnupg_home` | `~/.local/share/gpg-mcp/gnupg` | Isolated keyring. Must be `0700`. |
-| `approval` | `client` | `client` (MCP elicitation), `local` (zenity/TTY), `none` (tests only) |
+| `approval` | `client` | `client` (MCP elicitation), `local` (zenity; display required), `none` (tests only) |
 | `require_approval` | all high-risk ops | Operations that must be approved |
 | `destructive_confirmation` | `true` | Typed fingerprint suffix for destructive ops, independent of `require_approval` |
 | `allow_test_mode` | `false` | Required to use `approval = "none"` at serve time |
@@ -291,20 +291,20 @@ Config path: `~/.config/gpg-mcp/config.toml`, or `--config`, or `GPG_MCP_CONFIG`
 | `allowed_sign_keys` | `[]` | Full fingerprints allowed to sign. Empty = any in a dedicated keyring, none in `~/.gnupg` |
 | `allowed_decrypt_keys` | `[]` | Same rule for decryption |
 | `allowed_recipients` | `[]` | Optional recipient allow-list for encryption |
-| `default_sign_key` | unset | Advisory default; explicit `signer` is still required |
 | `enable_network` | `false` | Keyserver search/fetch/send |
 | `enable_symmetric` | `false` | Symmetric encrypt/decrypt |
 | `allow_unprotected_keys` | `false` | Permit `protect=false` key creation (test keyrings only) |
 | `allow_hidden_recipients` | `false` | Permit decryption of hidden-recipient messages |
 | `max_input_bytes` | `10485760` | Input cap |
-| `max_output_bytes` | `20971520` | Output cap |
+| `max_output_bytes` | `20971520` | Output cap; the status-file limit is `max(1 MiB, this value)` |
 | `timeout_s` | `120` | Per-operation timeout |
 | `keygen_timeout_s` | `300` | Key generation / passphrase-change timeout |
 | `keyserver` | `hkps://keys.openpgp.org` | Config-only; `hkps://` or `https://` only |
 | `audit_log` | `~/.local/share/gpg-mcp/audit.jsonl` | Append-only JSONL, `0600` |
 
 Environment overrides: `GPG_MCP_CONFIG`, `GPG_MCP_HOME`, `GPG_MCP_APPROVAL`,
-`GPG_MCP_ENABLE_NETWORK`, `GPG_MCP_ENABLE_SYMMETRIC`, `GPG_MCP_AUDIT`.
+`GPG_MCP_ENABLE_NETWORK`, `GPG_MCP_ENABLE_SYMMETRIC`, `GPG_MCP_AUDIT`,
+`GPG_MCP_ALLOW_TEST_MODE`, `GPG_MCP_AUDIT_REQUIRED`.
 
 ---
 
@@ -342,7 +342,7 @@ Key management:
 | `create_key` | Create a key; passphrase via pinentry |
 | `add_subkey`, `add_uid`, `set_expiry` | Modify a key |
 | `change_passphrase` | Old/new passphrase via pinentry |
-| `import_public_key` | Import public material; secret packets rejected |
+| `import_public_key` | Import public material; secret packets and revocation signatures rejected |
 | `delete_key` | Delete public or secret+public; typed confirmation |
 | `set_ownertrust` | `never`/`marginal`/`full`; ultimate is CLI-only |
 | `generate_revocation` | Validate and return the stored revocation certificate |
@@ -389,8 +389,9 @@ both `sign` and `encrypt`; `encrypt(..., sign_with=...)` inherits `sign` as well
 
 Destructive operations require the typed fingerprint suffix whenever
 `destructive_confirmation = true` (the default), even if the operation was removed from
-`require_approval`. Set it to `false` only if you intentionally want to disable both the approval and
-the typed confirmation; `approval = "none"` also bypasses it for disposable test keyrings.
+`require_approval`. Setting it to `false` removes only the typed-confirmation requirement; approval
+still applies if the operation remains in `require_approval`. `approval = "none"` bypasses both for
+disposable test keyrings.
 
 For revocation imports, the approval form shows the identity derived from the certificate itself,
 not merely the fingerprint passed as an argument. A certificate for a different key is rejected
@@ -435,8 +436,8 @@ the same-user model for simplicity.
 
 Put the private key on an OpenPGP smartcard or YubiKey. The key never exists on disk, and each
 signature can require a PIN and a physical touch. `gpg-mcp` works unchanged: `card_status` reports
-the card, and `list_keys` marks card-backed secret keys. Key generation on the card is done
-out-of-band with `gpg --edit-card`.
+the card and its keys, and `list_keys` returns secret-key metadata. Key generation on the card is
+done out-of-band with `gpg --edit-card`.
 
 ### systemd hardening
 
@@ -460,7 +461,7 @@ and run it as a dedicated user in the separate-user design.
 Every high-risk operation appends one JSON object to `audit.jsonl`:
 
 ```json
-{"ts":"2026-10-24T20:00:00Z","event":"operation","tool":"sign",
+{"ts":"2026-10-24T20:00:00Z","event":"operation","phase":"outcome","tool":"sign",
  "fingerprint":"F759...E793","mode":"detached",
  "payload_sha256":"...","size":42,"result":"ok"}
 ```
@@ -537,6 +538,7 @@ operations. It asserts, among other things, that:
 - option-injection attempts fail validation.
 
 CI runs `ruff` and `pytest` on Python 3.11, 3.12 and 3.13 with GnuPG installed (`.github/workflows/ci.yml`).
+`main` is protected and requires all three CI jobs; direct pushes are rejected.
 
 ---
 
@@ -555,7 +557,9 @@ CI runs `ruff` and `pytest` on Python 3.11, 3.12 and 3.13 with GnuPG installed (
   and `zenity`; Windows is not supported.
 - `generate_revocation` returns a revocation-capable certificate to the caller. Treat the result as
   sensitive and store it offline. The approval prompt explains the consequence.
-- `import_revocation` handles full primary-key revocation, not selective subkey or UID revocation.
+- On GnuPG versions without `--proc-all-sigs`, cleartext, inline, and embedded signature enumeration
+  may stop at the first bad signature; the result is still rejected. Detached signatures use the
+  per-packet fallback.
 
 ---
 
