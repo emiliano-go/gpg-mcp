@@ -59,11 +59,14 @@ fail. Set `audit_required = false` only for disposable test keyrings.
 
 The config path is walked with directory file descriptors and `O_NOFOLLOW`, and the opened file is
 validated through `fstat`; ancestors must be owned by the user or root and must not be group/world
-writable without the sticky bit. `init` creates the config with exclusive/no-follow semantics, refuses a symlinked
+writable without the sticky bit. The keyring path is not symlink-resolved; `serve`, `doctor` and
+`init` validate the original path and its full ancestor chain, rejecting symlinked keyrings or
+ancestors. `init` creates the config with exclusive/no-follow semantics, refuses a symlinked
 `gpg-agent.conf`, and cannot write through a dangling config symlink. Config, keyring and audit
 directories are created incrementally relative to validated directory descriptors; a symlinked or
 otherwise unsafe ancestor is rejected before anything is created through it. The audit ledger uses
-the same directory-fd walk, so an unsafe ancestor cannot redirect or replace it.
+the same directory-fd walk, so an unsafe ancestor cannot redirect or replace it. Secure-walk
+failures close every opened descriptor, so repeated invalid paths do not leak file descriptors.
 
 Symmetric decryption is restricted to symmetric-only ciphertext and applies the same strict status
 policy: `DECRYPTION_OKAY` is required, generic errors/failures and bad integrity checks are fatal,

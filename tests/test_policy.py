@@ -8,8 +8,10 @@ import pytest
 from gpg_mcp.errors import InputError, PolicyError, contains_secret_material, redact
 from gpg_mcp.policy import (
     assert_keyring_permissions,
+    assert_secure_ancestors,
     assert_sign_key_allowed,
     decode_payload,
+    ensure_secure_dir,
     load_policy,
     reset_policy_cache,
     validate_hash_algo,
@@ -387,3 +389,67 @@ def test_init_does_not_create_through_symlinked_ancestor(tmp_path) -> None:
     with pytest.raises(PolicyError):
         cmd_init(argparse.Namespace(home=str(home), config=str(config)))
     assert not (real / "missing").exists()
+
+
+def test_keyring_symlinked_ancestor_is_rejected(tmp_path) -> None:
+    real = tmp_path / "keyring-real"
+    real.mkdir()
+    link = tmp_path / "keyring-link"
+    link.symlink_to(real, target_is_directory=True)
+    home = link / "gnupg"
+    (real / "gnupg").mkdir(mode=0o700)
+    with pytest.raises(PolicyError):
+        assert_keyring_permissions(home)
+
+
+def test_keyring_symlink_itself_is_rejected(tmp_path) -> None:
+    target = tmp_path / "keyring-target"
+    target.mkdir(mode=0o700)
+    home = tmp_path / "gnupg"
+    home.symlink_to(target, target_is_directory=True)
+    with pytest.raises(PolicyError):
+        assert_keyring_permissions(home)
+
+
+def test_keyring_writable_ancestor_is_rejected(tmp_path) -> None:
+    unsafe = tmp_path / "keyring-unsafe"
+    unsafe.mkdir()
+    os.chmod(unsafe, 0o777)
+    child = unsafe / "child"
+    child.mkdir(mode=0o700)
+    home = child / "gnupg"
+    home.mkdir(mode=0o700)
+    with pytest.raises(PolicyError):
+        assert_keyring_permissions(home)
+
+
+def test_init_rejects_symlinked_home_ancestor(tmp_path) -> None:
+    import argparse
+
+    from gpg_mcp.__main__ import cmd_init
+
+    real = tmp_path / "init-real"
+    real.mkdir()
+    link = tmp_path / "init-link"
+    link.symlink_to(real, target_is_directory=True)
+    home = link / "gnupg"
+    config = tmp_path / "init-config.toml"
+    with pytest.raises(PolicyError):
+        cmd_init(argparse.Namespace(home=str(home), config=str(config)))
+    assert not (real / "gnupg").exists()
+
+
+def test_secure_walk_does_not_leak_fds(tmp_path) -> None:
+    unsafe = tmp_path / "fd-unsafe"
+    unsafe.mkdir()
+    os.chmod(unsafe, 0o777)
+    child = unsafe / "child"
+    child.mkdir(mode=0o700)
+    before = len(os.listdir("/proc/self/fd"))
+    for _ in range(50):
+        with pytest.raises(PolicyError):
+            assert_secure_ancestors(child)
+        with pytest.raises(PolicyError):
+            ensure_secure_dir(child)
+    after = len(os.listdir("/proc/self/fd"))
+    assert after <= before + 2

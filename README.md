@@ -86,9 +86,11 @@ fixed, typed surface with deliberate omissions:
 16. **GnuPG configuration is deterministic.** The runner uses `--no-options` and
     `--pinentry-mode ask`, so a hostile `gpg.conf` cannot switch on loopback pinentry or change
     other security-relevant defaults.
-17. **Configuration and audit files are checked.** The config path is walked with directory file
-    descriptors and `O_NOFOLLOW`, and the opened file is validated through `fstat`, so validation
-    and use cannot race or be redirected by a path swap. Ancestors must be owned by the user or
+17. **Filesystem paths are checked without following symlinks.** The config path is walked with
+    directory file descriptors and `O_NOFOLLOW`, and the opened file is validated through `fstat`,
+    so validation and use cannot race or be redirected by a path swap. The keyring path is kept
+    unresolved (`GNUPGHOME` is not symlink-resolved); `serve`, `doctor` and `init` validate its full
+    ancestor chain and reject a symlinked keyring or ancestor. Ancestors must be owned by the user or
     root and must not be group/world writable without the sticky bit. Unknown keys are rejected.
     Existing audit files are `fstat`ed, non-regular/foreign-owned files are refused, and group/other
     access is tightened to `0600`. With `audit_required = true`, an audit failure fails the
@@ -176,6 +178,7 @@ sequence.
 | The config is swapped between validation and open | Directory-fd path walk + `O_NOFOLLOW` + `fstat` on the opened descriptor |
 | A path ancestor is swapped by another user | Ancestors are walked with dir fds; non-sticky writable ancestors are refused |
 | `init` follows a planted `gpg-agent.conf` symlink | `lstat`/`O_NOFOLLOW` and regular-file/owner checks |
+| A symlinked keyring ancestor redirects `GNUPGHOME` | The unresolved path and its full ancestor chain are validated at serve/doctor/init time |
 | Multibyte text allocates far beyond the input limit | UTF-8 encoded in bounded chunks before acceptance |
 | An outcome audit fails after an irreversible action | Intent and outcome phases are recorded; outcome failure says the operation may have completed |
 | A hostile `gpg.conf` changes runner behavior | `--no-options` and explicit `--pinentry-mode ask` |
@@ -517,6 +520,8 @@ operations. It asserts, among other things, that:
 - hybrid decryption tolerates only the recoverable symmetric-passphrase failure pattern;
 - symmetric decryption rejects unexplained nonzero exits and only excuses recognized signature failures when `verify=false`;
 - config, keyring and audit directory creation cannot write through a symlinked ancestor;
+- symlinked keyring paths and writable keyring ancestors are rejected at serve/doctor/init time;
+- invalid secure-walk paths do not leak directory descriptors;
 - multiple signatures are enumerated and fail closed both with and without `--proc-all-sigs`;
 - hybrid symmetric/public-key ciphertext is rejected by `symmetric_decrypt`;
 - audit short writes, intent/outcome phases, and outcome failures are handled;
