@@ -92,6 +92,8 @@ async def test_apply_revokes_only_the_target(connect) -> None:
         )
         assert applied["applied"] is True
         assert applied["revoked"] is True
+        assert applied["imported"] is True
+        assert applied["revocation_imported"] is True
         key = ok(await call(client, "get_key", fingerprint=fpr))["key"]
         assert key["validity"] == "revoked"
         ok(await call(client, "delete_key", fingerprint=fpr, secret=True))

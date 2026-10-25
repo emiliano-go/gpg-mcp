@@ -1400,6 +1400,8 @@ class Gpg:
             "uid": validated["uid"],
             "uids": validated["uids"],
             **summary,
+            "imported": True,
+            "revocation_imported": True,
         }
 
     async def revoke_key(self, fingerprint: str) -> dict[str, Any]:
