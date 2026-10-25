@@ -445,11 +445,28 @@ def test_secure_walk_does_not_leak_fds(tmp_path) -> None:
     os.chmod(unsafe, 0o777)
     child = unsafe / "child"
     child.mkdir(mode=0o700)
-    before = len(os.listdir("/proc/self/fd"))
+    fd_path = "/proc/self/fd"
+    if not os.path.isdir(fd_path):
+        fd_path = "/dev/fd"
+    if not os.path.isdir(fd_path):
+        pytest.skip("descriptor count requires /proc/self/fd or /dev/fd")
+    before = len(os.listdir(fd_path))
     for _ in range(50):
         with pytest.raises(PolicyError):
             assert_secure_ancestors(child)
         with pytest.raises(PolicyError):
             ensure_secure_dir(child)
-    after = len(os.listdir("/proc/self/fd"))
+    after = len(os.listdir(fd_path))
     assert after <= before + 2
+
+
+def test_missing_keyring_reports_initialization_hint(tmp_path) -> None:
+    missing_parent = tmp_path / "missing" / "gnupg"
+    with pytest.raises(PolicyError) as exc:
+        assert_keyring_permissions(missing_parent)
+    assert "Run 'gpg-mcp init' first" in str(exc.value)
+
+    missing_home = tmp_path / "gnupg"
+    with pytest.raises(PolicyError) as exc:
+        assert_keyring_permissions(missing_home)
+    assert "Run 'gpg-mcp init' first" in str(exc.value)
