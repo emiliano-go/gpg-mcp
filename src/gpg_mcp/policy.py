@@ -283,24 +283,24 @@ def assert_config_parent(path: Path) -> None:
 def _check_secure_dir(fd: int) -> None:
     st = os.fstat(fd)
     if not stat.S_ISDIR(st.st_mode):
-        raise PolicyError("config path component is not a directory")
+        raise PolicyError("path component is not a directory")
     if st.st_uid not in (0, os.getuid()):
-        raise PolicyError("config path component is owned by another user")
+        raise PolicyError("path component is owned by another user")
     mode = stat.S_IMODE(st.st_mode)
     if mode & 0o022 and not mode & stat.S_ISVTX:
         raise PolicyError(
-            "config path component is group/world writable without sticky bit"
+            "path component is group/world writable without sticky bit"
         )
 
 
-def open_config_secure(path: Path) -> int:
-    """Walk the config path with directory fds and no-follow semantics."""
+def _open_dir_secure(path: Path) -> int:
+    """Walk a directory path with directory fds and no-follow semantics."""
     absolute = Path(os.path.abspath(path))
     parts = absolute.parts
     dir_fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY)
     try:
         _check_secure_dir(dir_fd)
-        for part in parts[1:-1]:
+        for part in parts[1:]:
             next_fd = os.open(
                 part,
                 os.O_RDONLY
@@ -311,9 +311,46 @@ def open_config_secure(path: Path) -> int:
             _check_secure_dir(next_fd)
             os.close(dir_fd)
             dir_fd = next_fd
+        return dir_fd
+    except BaseException:
+        os.close(dir_fd)
+        raise
+
+
+def assert_secure_ancestors(path: Path) -> None:
+    fd = _open_dir_secure(path)
+    os.close(fd)
+
+
+def open_config_secure(path: Path) -> int:
+    """Open a config file relative to a securely walked parent."""
+    dir_fd = _open_dir_secure(path.parent)
+    try:
         return os.open(
-            parts[-1],
+            path.name,
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=dir_fd,
+        )
+    finally:
+        os.close(dir_fd)
+
+
+def open_audit_secure(path: Path) -> int:
+    """Open an audit file relative to a securely walked parent."""
+    parent = path.parent
+    if not parent.exists():
+        parent.mkdir(parents=True, mode=0o700)
+        os.chmod(parent, 0o700)
+    dir_fd = _open_dir_secure(parent)
+    try:
+        return os.open(
+            path.name,
+            os.O_APPEND
+            | os.O_CREAT
+            | os.O_WRONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            0o600,
             dir_fd=dir_fd,
         )
     finally:
@@ -684,20 +721,7 @@ def audit(policy: Policy, record: dict[str, Any], *, phase: str = "outcome") -> 
     }
     line = json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n"
     try:
-        parent = policy.audit_log.parent
-        if not parent.exists():
-            # Only tighten permissions on a directory this process creates.
-            # Never chmod an existing arbitrary parent (for example /tmp).
-            parent.mkdir(parents=True, mode=0o700)
-            os.chmod(parent, 0o700)
-        flags = (
-            os.O_APPEND
-            | os.O_CREAT
-            | os.O_WRONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-        )
-        fd = os.open(policy.audit_log, flags, 0o600)
+        fd = open_audit_secure(policy.audit_log)
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
@@ -721,6 +745,8 @@ def audit(policy: Policy, record: dict[str, Any], *, phase: str = "outcome") -> 
                 view = view[written:]
         finally:
             os.close(fd)
+    except PolicyError as exc:
+        _audit_failure(policy, str(exc), phase)
     except OSError as exc:  # pragma: no cover - depends on host
         _audit_failure(policy, str(exc), phase)
 

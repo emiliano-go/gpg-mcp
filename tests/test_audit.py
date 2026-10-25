@@ -151,3 +151,17 @@ def test_audit_outcome_failure_is_explicit(tmp_path) -> None:
     assert "outcome" in str(exc.value)
     assert exc.value.data.get("operation_may_have_completed") is True
     reset_policy_cache()
+
+
+def test_audit_rejects_non_sticky_writable_ancestor(tmp_path) -> None:
+    unsafe = tmp_path / "unsafe-audit"
+    unsafe.mkdir()
+    os.chmod(unsafe, 0o777)
+    child = unsafe / "child"
+    child.mkdir(mode=0o700)
+    log = child / "audit.jsonl"
+    policy = _policy(tmp_path, str(log), audit_required=True)
+    with pytest.raises(AuditError):
+        audit(policy, {"event": "test"})
+    assert not log.exists()
+    reset_policy_cache()

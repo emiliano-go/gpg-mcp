@@ -40,11 +40,11 @@ from .errors import (
 from .policy import (
     Policy,
     assert_config_file,
-    assert_config_parent,
     assert_decrypt_key_allowed,
     assert_keyring_permissions,
     assert_manage_key_allowed,
     assert_recipient_allowed,
+    assert_secure_ancestors,
     assert_sign_key_allowed,
     encode_payload,
     require_fingerprint,
@@ -481,6 +481,56 @@ def import_result(result: GpgResult, summary: dict[str, Any]) -> dict[str, Any]:
     return {**summary, "gpg_exit_code": result.returncode, "status": status}
 
 
+def decryption_status_ok(
+    status: list[StatusEvent], returncode: int, *, hybrid: bool = False
+) -> bool:
+    """Accept only a clean public-key decryption.
+
+    A hybrid message may first attempt the symmetric session key and fail to
+    obtain its passphrase. That specific recoverable pattern is tolerated only
+    when GnuPG also reports DECRYPTION_KEY and DECRYPTION_OKAY. Any other
+    error/failure/nonzero exit is fatal.
+    """
+    if not any(event.keyword == "DECRYPTION_OKAY" for event in status):
+        return False
+    if any(event.keyword in {"DECRYPTION_FAILED", "BADMDC"} for event in status):
+        return False
+    symkey_error = any(
+        event.keyword == "ERROR"
+        and event.args
+        and (
+            event.args[0].startswith("symkey_decrypt")
+            or event.args[0] == "get_passphrase"
+        )
+        for event in status
+    )
+    has_key = any(event.keyword == "DECRYPTION_KEY" for event in status)
+    if symkey_error and not hybrid:
+        return False
+    for event in status:
+        if event.keyword == "ERROR":
+            if event.args and (
+                event.args[0].startswith("symkey_decrypt")
+                or event.args[0] == "get_passphrase"
+            ):
+                continue
+            return False
+        if event.keyword == "FAILURE":
+            if (
+                event.args
+                and event.args[0] == "gpg-exit"
+                and returncode != 0
+                and hybrid
+                and symkey_error
+                and has_key
+            ):
+                continue
+            return False
+    if returncode == 0:
+        return True
+    return hybrid and symkey_error and has_key
+
+
 def _created_key(status: list[StatusEvent]) -> str | None:
     for ev in status:
         if ev.keyword == "KEY_CREATED" and len(ev.args) >= 2:
@@ -820,7 +870,7 @@ class Gpg:
         checks["gpg"] = {"path": self.gpg, "ok": bool(self.gpg)}
         checks["gpgconf"] = {"path": self.gpgconf, "ok": bool(self.gpgconf)}
         try:
-            assert_config_parent(self.policy.config_path)
+            assert_secure_ancestors(self.policy.config_path.parent)
             assert_config_file(self.policy.config_path)
             checks["config"] = {"path": str(self.policy.config_path), "ok": True}
         except Exception as exc:  # noqa: BLE001
@@ -1262,14 +1312,28 @@ class Gpg:
                 raise PolicyError(
                     "ciphertext is not addressed to an allowed decryption key"
                 )
+        # Do not disable the symmetric cache here: gpg may try the symmetric
+        # session key before falling back to a public key in a hybrid message.
+        # A symmetric-only result is rejected by the public-key check below.
+        decrypt_args = ["--decrypt"]
+        # --proc-all-sigs is a verification option and changes hybrid
+        # fallback behavior, so only add it for public-key-only input.
+        if not preflight["symmetric"] and await self._supports_proc_all_sigs():
+            decrypt_args.insert(0, "--proc-all-sigs")
         result = await self.run(
-            ["--decrypt", "--no-symkey-cache"], input_data=ciphertext, check=False
+            decrypt_args, input_data=ciphertext, check=False
         )
         status = result.status
-        decryption_ok = any(ev.keyword == "DECRYPTION_OKAY" for ev in status)
-        bad_mdc = any(ev.keyword == "BADMDC" for ev in status)
-        if bad_mdc or not decryption_ok:
-            raise self._execution_error(result)
+        if not decryption_status_ok(
+            status, result.returncode, hybrid=preflight["symmetric"]
+        ):
+            if result.returncode != 0:
+                raise self._execution_error(result)
+            raise GpgMcpError(
+                "gpg reported a fatal decryption status",
+                code="decryption_failed",
+                data={"status": result.status_dict()},
+            )
         actual_keys = self._check_decryption_key(status, wanted)
         sig = _verification(status)
         has_signature = sig["status"] not in {"UNKNOWN", None}
@@ -1323,8 +1387,11 @@ class Gpg:
                 "symmetric_decrypt requires symmetric-only ciphertext; "
                 "use decrypt for hybrid public-key/symmetric messages"
             )
+        decrypt_args = ["--decrypt", "--no-symkey-cache"]
+        if await self._supports_proc_all_sigs():
+            decrypt_args.insert(0, "--proc-all-sigs")
         result = await self.run(
-            ["--decrypt", "--no-symkey-cache"], input_data=ciphertext, check=False
+            decrypt_args, input_data=ciphertext, check=False
         )
         if any(ev.keyword in {"DECRYPTION_FAILED", "BADMDC", "ERROR", "FAILURE"} for ev in result.status):
             raise self._execution_error(result)
