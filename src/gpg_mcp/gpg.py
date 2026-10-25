@@ -1192,7 +1192,6 @@ class Gpg:
         self,
         status: list[StatusEvent],
         wanted: list[str],
-        preflight: dict[str, Any],
     ) -> list[dict[str, Any]]:
         allowed = {fpr.upper() for fpr in wanted}
         used = [
@@ -1201,12 +1200,11 @@ class Gpg:
             if event.keyword == "DECRYPTION_KEY" and len(event.args) >= 2
         ]
         if not used:
-            if preflight["public_key_ids"] and not preflight["symmetric"]:
-                raise GpgMcpError(
-                    "gpg did not report which key performed decryption",
-                    code="decryption_key_unknown",
-                )
-            return []
+            raise GpgMcpError(
+                "gpg did not report which public key performed decryption; "
+                "decrypt() refuses a symmetric fallback",
+                code="decryption_key_unknown",
+            )
         actual: list[dict[str, Any]] = []
         for event in used:
             fingerprint = event.args[0].upper()
@@ -1235,12 +1233,9 @@ class Gpg:
         preflight = await self.inspect_recipients(ciphertext)
         if not preflight["encrypted"]:
             raise GpgMcpError("input is not an encrypted message", code="not_encrypted")
-        if preflight["symmetric"] and not self.policy.enable_symmetric:
-            raise PolicyError("symmetric decryption is disabled by configuration")
-        if expected_key and preflight["symmetric"] and not preflight["public_key_ids"]:
-            raise InputError(
-                "expected_key cannot be used with a symmetric-only message; "
-                "use symmetric_decrypt"
+        if preflight["symmetric"] and not preflight["public_key_ids"]:
+            raise PolicyError(
+                "symmetric-only ciphertext must use symmetric_decrypt"
             )
         allowed_keyids, wanted = await self._allowed_decrypt_keyids(expected_key)
         all_keyids = preflight["public_key_ids"]
@@ -1271,11 +1266,11 @@ class Gpg:
             ["--decrypt", "--no-symkey-cache"], input_data=ciphertext, check=False
         )
         status = result.status
-        if any(ev.keyword in {"DECRYPTION_FAILED", "BADMDC", "ERROR", "FAILURE"} for ev in status):
+        decryption_ok = any(ev.keyword == "DECRYPTION_OKAY" for ev in status)
+        bad_mdc = any(ev.keyword == "BADMDC" for ev in status)
+        if bad_mdc or not decryption_ok:
             raise self._execution_error(result)
-        if result.returncode != 0 and not any(ev.keyword == "DECRYPTION_OKAY" for ev in status):
-            raise self._execution_error(result)
-        actual_keys = self._check_decryption_key(status, wanted, preflight)
+        actual_keys = self._check_decryption_key(status, wanted)
         sig = _verification(status)
         has_signature = sig["status"] not in {"UNKNOWN", None}
         if verify and has_signature and not sig["valid"]:

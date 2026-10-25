@@ -180,9 +180,8 @@ def test_actual_decryption_key_must_be_allowed() -> None:
     status = [
         StatusEvent("DECRYPTION_KEY", ["B" * 40, "B" * 40, "u"], ""),
     ]
-    preflight = {"public_key_ids": ["AAAAAAAAAAAAAAAA"], "symmetric": False}
     try:
-        Gpg._check_decryption_key(None, status, ["A" * 40], preflight)
+        Gpg._check_decryption_key(None, status, ["A" * 40])
     except PolicyError as exc:
         assert "outside the allow-list" in str(exc)
     else:
@@ -192,12 +191,11 @@ def test_actual_decryption_key_must_be_allowed() -> None:
         None,
         [StatusEvent("DECRYPTION_KEY", ["A" * 40, "A" * 40, "u"], "")],
         ["A" * 40],
-        preflight,
     )
     assert allowed[0]["primary_fingerprint"] == "A" * 40
 
     try:
-        Gpg._check_decryption_key(None, [], ["A" * 40], preflight)
+        Gpg._check_decryption_key(None, [], ["A" * 40])
     except GpgMcpError as exc:
         assert "did not report" in str(exc)
     else:

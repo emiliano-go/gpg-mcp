@@ -280,12 +280,50 @@ def assert_config_parent(path: Path) -> None:
         raise PolicyError("config parent must not be group/world writable")
 
 
-def read_config_file(path: Path) -> dict[str, Any]:
-    """Open and parse the config without a validation/open race."""
-    try:
-        fd = os.open(
-            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _check_secure_dir(fd: int) -> None:
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise PolicyError("config path component is not a directory")
+    if st.st_uid not in (0, os.getuid()):
+        raise PolicyError("config path component is owned by another user")
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o022 and not mode & stat.S_ISVTX:
+        raise PolicyError(
+            "config path component is group/world writable without sticky bit"
         )
+
+
+def open_config_secure(path: Path) -> int:
+    """Walk the config path with directory fds and no-follow semantics."""
+    absolute = Path(os.path.abspath(path))
+    parts = absolute.parts
+    dir_fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _check_secure_dir(dir_fd)
+        for part in parts[1:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=dir_fd,
+            )
+            _check_secure_dir(next_fd)
+            os.close(dir_fd)
+            dir_fd = next_fd
+        return os.open(
+            parts[-1],
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=dir_fd,
+        )
+    finally:
+        os.close(dir_fd)
+
+
+def read_config_file(path: Path) -> dict[str, Any]:
+    """Open and parse the config without a validation/open or path race."""
+    try:
+        fd = open_config_secure(path)
     except FileNotFoundError:
         return {}
     except OSError as exc:

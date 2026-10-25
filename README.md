@@ -86,13 +86,18 @@ fixed, typed surface with deliberate omissions:
 16. **GnuPG configuration is deterministic.** The runner uses `--no-options` and
     `--pinentry-mode ask`, so a hostile `gpg.conf` cannot switch on loopback pinentry or change
     other security-relevant defaults.
-17. **Configuration and audit files are checked.** The config is opened with `O_NOFOLLOW` and
-    validated through `fstat`, so validation and use cannot race; its parent must also be a
-    user-owned directory that is not group/world-writable. Unknown keys are rejected. Existing
-    audit files are `fstat`ed, non-regular/foreign-owned files are refused, and group/other access
-    is tightened to `0600`. With `audit_required = true`, an audit failure fails the operation.
-18. **Symmetric decryption is symmetric-only.** `symmetric_decrypt` rejects hybrid ciphertext that
-    also carries public-key recipients, so it cannot bypass the regular decryption-key allow-list.
+17. **Configuration and audit files are checked.** The config path is walked with directory file
+    descriptors and `O_NOFOLLOW`, and the opened file is validated through `fstat`, so validation
+    and use cannot race or be redirected by a path swap. Ancestors must be owned by the user or
+    root and must not be group/world writable without the sticky bit. Unknown keys are rejected.
+    Existing audit files are `fstat`ed, non-regular/foreign-owned files are refused, and group/other
+    access is tightened to `0600`. With `audit_required = true`, an audit failure fails the
+    operation. `init` refuses a symlinked `gpg-agent.conf` instead of chmodding its target.
+18. **Decryption routing is unambiguous.** `symmetric_decrypt` rejects hybrid ciphertext that also
+    carries public-key recipients. `decrypt` rejects symmetric-only ciphertext and refuses to return
+    plaintext unless GnuPG reports an actual allow-listed public key; it never falls back to the
+    symmetric route. A custom policy that gates only `symmetric_decrypt` therefore cannot be bypassed
+    through `decrypt`.
 19. **Multi-signature enumeration is complete.** On GnuPG versions without `--proc-all-sigs`, the
     verifier splits detached signatures and verifies each packet independently, then aggregates
     fail-closed across all of them.
@@ -154,9 +159,12 @@ sequence.
 | A revocation certificate is submitted through the generic importer | Packet-level revocation-signature rejection; use `import_revocation` |
 | Decryption silently uses a non-allow-listed secret key | `DECRYPTION_KEY` status is checked; plaintext is discarded on mismatch |
 | A huge/incomplete status file is treated as success | `max_status_bytes` is enforced; partial status fails closed |
-| A hybrid message routes symmetric decryption around the key allow-list | `symmetric_decrypt` rejects public-key recipients |
+| A hybrid message routes symmetric decryption around the key allow-list | `symmetric_decrypt` rejects public-key recipients; `decrypt` requires a reported allow-listed public key |
+| Symmetric-only input uses the less-restricted `decrypt` approval | `decrypt` rejects symmetric-only ciphertext before execution |
 | An older GnuPG stops at the first bad signature | Detached packets are verified individually and aggregated fail-closed |
-| The config is swapped between validation and open | `O_NOFOLLOW` + `fstat` on the opened descriptor; unsafe parent refused |
+| The config is swapped between validation and open | Directory-fd path walk + `O_NOFOLLOW` + `fstat` on the opened descriptor |
+| A path ancestor is swapped by another user | Ancestors are walked with dir fds; non-sticky writable ancestors are refused |
+| `init` follows a planted `gpg-agent.conf` symlink | `lstat`/`O_NOFOLLOW` and regular-file/owner checks |
 | Multibyte text allocates far beyond the input limit | UTF-8 encoded in bounded chunks before acceptance |
 | An outcome audit fails after an irreversible action | Intent and outcome phases are recorded; outcome failure says the operation may have completed |
 | A hostile `gpg.conf` changes runner behavior | `--no-options` and explicit `--pinentry-mode ask` |
@@ -310,7 +318,7 @@ Crypto:
 | `sign` | Detached, cleartext or inline signature |
 | `encrypt` | Encrypt to full recipient fingerprints |
 | `sign_and_encrypt` | Sign and encrypt |
-| `decrypt` | Decrypt with recipient preflight and signature check |
+| `decrypt` | Decrypt public-key or hybrid ciphertext via an allow-listed key; symmetric-only input must use `symmetric_decrypt` |
 | `symmetric_encrypt` / `symmetric_decrypt` | Passphrase symmetric crypto (opt-in) |
 
 Key management:
@@ -489,6 +497,10 @@ operations. It asserts, among other things, that:
 - the actual `DECRYPTION_KEY` must be allow-listed;
 - status output over the configured limit fails closed;
 - a hostile `gpg.conf` is ignored;
+- symmetric-only input is rejected by `decrypt` while hybrid input succeeds through an allow-listed public key;
+- a custom policy that gates only `symmetric_decrypt` cannot be bypassed through `decrypt`;
+- config ancestors are walked securely and non-sticky writable ancestors are rejected;
+- `init` refuses a symlinked `gpg-agent.conf`;
 - multiple signatures are enumerated and fail closed both with and without `--proc-all-sigs`;
 - hybrid symmetric/public-key ciphertext is rejected by `symmetric_decrypt`;
 - audit short writes, intent/outcome phases, and outcome failures are handled;

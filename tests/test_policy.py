@@ -324,3 +324,36 @@ def test_unsafe_config_parent_is_rejected(tmp_path) -> None:
 def test_utf8_input_limit_is_enforced_before_large_allocation() -> None:
     with pytest.raises(InputError):
         decode_payload("\U0001F600" * 10, None, limit=10)
+
+
+def test_config_non_sticky_writable_ancestor_is_rejected(tmp_path) -> None:
+    unsafe = tmp_path / "unsafe-ancestor"
+    unsafe.mkdir()
+    os.chmod(unsafe, 0o777)
+    child = unsafe / "child"
+    child.mkdir(mode=0o700)
+    config = child / "config.toml"
+    config.write_text(f'gnupg_home = "{tmp_path}"\n', encoding="utf-8")
+    os.chmod(config, 0o600)
+    reset_policy_cache()
+    with pytest.raises(PolicyError):
+        load_policy(config, env={})
+
+
+def test_init_refuses_agent_conf_symlink(tmp_path) -> None:
+    import argparse
+    import stat
+
+    from gpg_mcp.__main__ import cmd_init
+
+    home = tmp_path / "gnupg"
+    home.mkdir(mode=0o700)
+    target = tmp_path / "target.conf"
+    target.write_text("keep", encoding="utf-8")
+    os.chmod(target, 0o644)
+    (home / "gpg-agent.conf").symlink_to(target)
+    config = tmp_path / "config.toml"
+    with pytest.raises(PolicyError):
+        cmd_init(argparse.Namespace(home=str(home), config=str(config)))
+    assert target.read_text(encoding="utf-8") == "keep"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644

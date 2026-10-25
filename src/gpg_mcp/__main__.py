@@ -10,6 +10,7 @@ import stat
 import sys
 from pathlib import Path
 
+from .errors import PolicyError
 from .gpg import Gpg
 from .policy import (
     DEFAULT_CONFIG,
@@ -71,9 +72,25 @@ def cmd_init(args: argparse.Namespace) -> int:
     home.mkdir(parents=True, exist_ok=True)
     os.chmod(home, 0o700)
     agent_conf = home / "gpg-agent.conf"
-    if not agent_conf.exists():
-        agent_conf.write_text(AGENT_CONF, encoding="utf-8")
-    os.chmod(agent_conf, 0o600)
+    try:
+        agent_st = agent_conf.lstat()
+    except FileNotFoundError:
+        fd = os.open(
+            agent_conf,
+            os.O_CREAT
+            | os.O_EXCL
+            | os.O_WRONLY
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(AGENT_CONF)
+    else:
+        if not stat.S_ISREG(agent_st.st_mode) or agent_st.st_uid != os.getuid():
+            raise PolicyError(
+                "gpg-agent.conf must be a regular file owned by the current user"
+            )
+        os.chmod(agent_conf, 0o600)
     if not config.parent.exists():
         config.parent.mkdir(parents=True, mode=0o700)
         os.chmod(config.parent, 0o700)

@@ -57,9 +57,14 @@ as "the operation may have completed" and is never retried. An existing audit fi
 regular file, is owned by another user, or cannot be tightened to `0600` causes the operation to
 fail. Set `audit_required = false` only for disposable test keyrings.
 
-The config is opened with `O_NOFOLLOW` and validated through `fstat`; its parent must be a user-owned
-directory that is not group/world-writable. Symmetric decryption is restricted to symmetric-only
-ciphertext so hybrid messages cannot bypass the public-key allow-list.
+The config path is walked with directory file descriptors and `O_NOFOLLOW`, and the opened file is
+validated through `fstat`; ancestors must be owned by the user or root and must not be group/world
+writable without the sticky bit. `init` refuses a symlinked `gpg-agent.conf`.
+
+Symmetric decryption is restricted to symmetric-only ciphertext. `decrypt` rejects symmetric-only
+ciphertext and, for hybrid ciphertext, requires GnuPG to report an actual allow-listed public key;
+it never falls back to the symmetric route. A custom policy that gates only `symmetric_decrypt`
+therefore cannot be bypassed through `decrypt`.
 
 ## Platform support
 
