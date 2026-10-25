@@ -33,6 +33,7 @@ DEFAULT_CONFIG_TEXT = """\
 # gpg-mcp configuration. Restrictive defaults; edit deliberately.
 gnupg_home = "{home}"
 approval = "client"                 # client | local | none
+destructive_confirmation = true     # typed fingerprint suffix, independent of require_approval
 enable_network = false
 enable_symmetric = false
 allow_unprotected_keys = false

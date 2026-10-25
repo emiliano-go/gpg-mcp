@@ -293,8 +293,8 @@ def parse_colon_keys(text: str) -> list[dict[str, Any]]:
     return keys
 
 
-def _verification(status: list[StatusEvent]) -> dict[str, Any]:
-    """Classify a signature.
+def _verify_one(status: list[StatusEvent]) -> dict[str, Any]:
+    """Classify one signature sequence.
 
     ``cryptographically_valid`` means the math checked out (VALIDSIG).
     ``policy_acceptable`` additionally requires a GOODSIG with no expired
@@ -377,6 +377,79 @@ def _verification(status: list[StatusEvent]) -> dict[str, Any]:
     return out
 
 
+_SIGNATURE_EVENTS = {
+    "NEWSIG",
+    "VALIDSIG",
+    "GOODSIG",
+    "BADSIG",
+    "EXPSIG",
+    "EXPKEYSIG",
+    "REVKEYSIG",
+    "ERRSIG",
+    "NO_PUBKEY",
+    "KEYEXPIRED",
+    "SIGEXPIRED",
+    "KEYREVOKED",
+}
+
+
+def _signature_sequences(status: list[StatusEvent]) -> list[list[StatusEvent]]:
+    sequences: list[list[StatusEvent]] = []
+    current: list[StatusEvent] | None = None
+    for event in status:
+        if event.keyword == "NEWSIG":
+            if current:
+                sequences.append(current)
+            current = [event]
+        elif event.keyword in _SIGNATURE_EVENTS or event.keyword.startswith("TRUST_"):
+            if current is None:
+                current = []
+            current.append(event)
+    if current:
+        sequences.append(current)
+    return sequences
+
+
+def _worst_signature_status(results: list[dict[str, Any]]) -> str:
+    for candidate in ("BADSIG", "ERRSIG", "REVKEYSIG", "EXPSIG", "EXPKEYSIG", "UNKNOWN"):
+        if any(result["status"] == candidate for result in results):
+            return candidate
+    if all(result["status"] == "GOODSIG" for result in results):
+        return "GOODSIG"
+    return "UNKNOWN"
+
+
+def _verification(status: list[StatusEvent]) -> dict[str, Any]:
+    """Aggregate one result per NEWSIG sequence, failing closed across all.
+
+    A message can carry multiple signatures. An invalid signature must not be
+    hidden by a later valid one, so the aggregate is acceptable only when every
+    signature is policy-acceptable.
+    """
+    results = [_verify_one(sequence) for sequence in _signature_sequences(status)]
+    if not results:
+        return _verify_one([])
+    aggregate = dict(results[0])
+    aggregate["signatures"] = results
+    aggregate["signature_count"] = len(results)
+    if len(results) == 1:
+        return aggregate
+    aggregate["cryptographically_valid"] = all(
+        result["cryptographically_valid"] for result in results
+    )
+    aggregate["policy_acceptable"] = all(
+        result["policy_acceptable"] for result in results
+    )
+    aggregate["valid"] = aggregate["policy_acceptable"]
+    aggregate["identity_trusted"] = all(
+        result["identity_trusted"] for result in results
+    )
+    for flag in ("key_expired", "sig_expired", "key_revoked", "missing_key"):
+        aggregate[flag] = any(result[flag] for result in results)
+    aggregate["status"] = _worst_signature_status(results)
+    return aggregate
+
+
 def _created_key(status: list[StatusEvent]) -> str | None:
     for ev in status:
         if ev.keyword == "KEY_CREATED" and len(ev.args) >= 2:
@@ -450,6 +523,7 @@ class Gpg:
         self.gpgconf = secure_binary("gpgconf", required=False)
         self.env = _base_env(self.home)
         self._lock = asyncio.Lock()
+        self._proc_all: bool | None = None
 
     # -- process plumbing ---------------------------------------------------
 
@@ -627,6 +701,17 @@ class Gpg:
             raise TimeoutError_(f"{Path(binary).name} timed out") from None
         return proc.returncode or 0, out, redact(err.decode("utf-8", errors="replace"))
 
+    async def _supports_proc_all_sigs(self) -> bool:
+        if self._proc_all is None:
+            try:
+                rc, out, _ = await self.run_tool(
+                    self.gpg or "gpg", ["--dump-options"]
+                )
+                self._proc_all = rc == 0 and b"--proc-all-sigs" in out
+            except Exception:  # noqa: BLE001 - fall back to single-signature behavior
+                self._proc_all = False
+        return self._proc_all
+
     # -- version / doctor ---------------------------------------------------
 
     async def version(self) -> dict[str, Any]:
@@ -777,17 +862,20 @@ class Gpg:
     ) -> dict[str, Any]:
         if mode not in {"detached", "cleartext", "inline"}:
             raise InputError("mode must be detached, cleartext or inline")
+        args: list[str] = []
+        if await self._supports_proc_all_sigs():
+            args.append("--proc-all-sigs")
         if mode == "detached":
             if signature is None:
                 raise InputError("signature is required for detached verification")
             result = await self.run(
-                ["--verify", f"{_TMP}/sig", "-"],
+                [*args, "--verify", f"{_TMP}/sig", "-"],
                 input_data=data,
                 files={"sig": signature},
                 check=False,
             )
         else:
-            result = await self.run(["--verify", "-"], input_data=data, check=False)
+            result = await self.run([*args, "--verify", "-"], input_data=data, check=False)
         info = _verification(result.status)
         info["gpg_exit_code"] = result.returncode
         info["mode"] = mode

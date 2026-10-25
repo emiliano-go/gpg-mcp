@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import shutil
 import subprocess
@@ -188,3 +189,60 @@ async def test_decrypt_refuses_revoked_embedded_signature(connect) -> None:
         assert failure.is_error
         assert plaintext not in (failure.content[0].text if failure.content else "")
         ok(await call(client, "delete_key", fingerprint=fpr, secret=True))
+
+
+@pytest.mark.asyncio
+async def test_multiple_embedded_signatures_fail_closed(connect, keyring) -> None:
+    async with connect() as client:
+
+        async def raw_sign(data: str, signer: str) -> bytes:
+            result = await call(
+                client, "sign", data=data, signer=signer, armor=False
+            )
+            payload = result.structured_content["signature"]
+            return base64.b64decode(payload["data_base64"])
+
+        good = await raw_sign("multi", keyring.fpr)
+        good2 = await raw_sign("multi", keyring.fpr2)
+        bad = await raw_sign("different", keyring.fpr2)
+
+        two_good = base64.b64encode(good + good2).decode("ascii")
+        result = ok(
+            await call(
+                client,
+                "verify",
+                data="multi",
+                signature_base64=two_good,
+                mode="detached",
+            )
+        )
+        assert result["signature_count"] == 2
+        assert result["valid"] is True
+
+        bad_first = base64.b64encode(bad + good).decode("ascii")
+        result = ok(
+            await call(
+                client,
+                "verify",
+                data="multi",
+                signature_base64=bad_first,
+                mode="detached",
+            )
+        )
+        assert result["signature_count"] == 2
+        assert result["valid"] is False
+        assert result["status"] == "BADSIG"
+
+        good_first = base64.b64encode(good + bad).decode("ascii")
+        result = ok(
+            await call(
+                client,
+                "verify",
+                data="multi",
+                signature_base64=good_first,
+                mode="detached",
+            )
+        )
+        assert result["signature_count"] == 2
+        assert result["valid"] is False
+        assert result["status"] == "BADSIG"

@@ -318,3 +318,35 @@ async def test_resolver_falls_back_without_client_capability(
             client, "sign", data="fallback via resolver", signer=keyring.fpr
         )
         assert not result.is_error, result.content[0].text if result.content else result
+
+
+@pytest.mark.asyncio
+async def test_destructive_confirmation_survives_partial_policy(composite_env) -> None:
+    import mcp.types as types
+    from mcp import Client
+
+    composite_env(["sign"])
+    seen: list[dict] = []
+
+    async def cb(context, params):
+        props = params.requested_schema.get("properties") or {}
+        seen.append(props)
+        content = {"approve": True}
+        if "confirmation" in props:
+            match = re.search(r"\(([0-9A-F]{8})\)", params.message)
+            content["confirmation"] = match.group(1) if match else "WRONG"
+        return types.ElicitResult(action="accept", content=content)
+
+    async with Client(mcp, elicitation_callback=cb) as client:
+        created = await call(
+            client,
+            "create_key",
+            uid="Partial Policy <partial@example.com>",
+            protect=False,
+        )
+        assert not created.is_error, created.content[0].text
+        fpr = created.structured_content["fingerprint"]
+
+        deleted = await call(client, "delete_key", fingerprint=fpr, secret=True)
+        assert not deleted.is_error, deleted.content[0].text
+        assert any("confirmation" in props for props in seen)

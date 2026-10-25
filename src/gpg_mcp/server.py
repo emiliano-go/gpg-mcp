@@ -29,12 +29,19 @@ from .approval import (
     require_approved,
     set_approval_context,
 )
+from .errors import InputError, PolicyError, single_line
 from .gpg import Gpg
 from .policy import (
     audit,
     decode_payload,
     get_policy,
     require_fingerprint,
+    validate_expire,
+    validate_hash_algo,
+    validate_ownertrust,
+    validate_sign_algo,
+    validate_subkey_algo,
+    validate_uid,
 )
 
 INSTRUCTIONS = """\
@@ -95,7 +102,7 @@ async def _key_label(fingerprint: str | None) -> str:
         key = await gpg().get_key(fpr)
     except Exception:  # noqa: BLE001 - labels are best effort
         return fpr
-    uids = ", ".join(item["uid"] for item in key["uids"][:2])
+    uids = ", ".join(single_line(item["uid"], limit=200) for item in key["uids"][:2])
     return f"{fpr} ({uids})" if uids else fpr
 
 
@@ -114,13 +121,15 @@ async def _ask_sign(
 ) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
     payload = _decode(data, data_base64)
+    fpr = require_fingerprint(signer, what="signer")
+    algo = validate_hash_algo(hash_algo)
     return await request(
         "sign",
         payload_summary(
             "sign data",
             payload,
-            key=await _key_label(signer),
-            extra=f"Mode: {mode}\nArmor: {armor}\nHash: {hash_algo}",
+            key=await _key_label(fpr),
+            extra=f"Mode: {single_line(mode)}\nArmor: {armor}\nHash: {algo}",
         ),
     )
 
@@ -135,10 +144,12 @@ async def _ask_encrypt(
 ) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
     payload = _decode(data, data_base64)
-    recipient_labels = [await _key_label(recipient) for recipient in (recipients or [])]
+    recipient_fprs = [require_fingerprint(item) for item in (recipients or [])]
+    recipient_labels = [await _key_label(recipient) for recipient in recipient_fprs]
     recipient_text = "\n".join(f"- {label}" for label in recipient_labels) or "- none"
-    signer_label = await _key_label(sign_with) if sign_with else "no"
-    operations = ["encrypt"] + (["sign"] if sign_with else [])
+    sign_with_fpr = require_fingerprint(sign_with) if sign_with else None
+    signer_label = await _key_label(sign_with_fpr) if sign_with_fpr else "no"
+    operations = ["encrypt"] + (["sign"] if sign_with_fpr else [])
     return await request_all(
         operations,
         payload_summary(
@@ -162,14 +173,16 @@ async def _ask_sign_and_encrypt(
 ) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
     payload = _decode(data, data_base64)
-    recipient_labels = [await _key_label(recipient) for recipient in (recipients or [])]
+    signer_fpr = require_fingerprint(signer, what="signer")
+    recipient_fprs = [require_fingerprint(item) for item in (recipients or [])]
+    recipient_labels = [await _key_label(recipient) for recipient in recipient_fprs]
     recipient_text = "\n".join(f"- {label}" for label in recipient_labels) or "- none"
     return await request_all(
         ["sign", "encrypt"],
         payload_summary(
             "sign and encrypt data",
             payload,
-            key=await _key_label(signer),
+            key=await _key_label(signer_fpr),
             extra=f"Recipients:\n{recipient_text}\nArmor: {armor}",
         ),
     )
@@ -184,7 +197,8 @@ async def _ask_decrypt(
 ) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
     payload = _decode(ciphertext, ciphertext_base64)
-    label = await _key_label(expected_key) if expected_key else "auto"
+    expected_fpr = require_fingerprint(expected_key) if expected_key else None
+    label = await _key_label(expected_fpr) if expected_fpr else "auto"
     return await request(
         "decrypt",
         payload_summary(
@@ -229,11 +243,16 @@ async def _ask_create_key(
     ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
+    uid = validate_uid(uid)
+    algo = validate_sign_algo(algo)
+    expire = validate_expire(expire)
+    subkey_algo = validate_subkey_algo(subkey_algo)
     warning = "" if protect else "\nWARNING: the new key will have NO passphrase."
     return await request(
         "create_key",
-        f"gpg-mcp wants to create a key.\nUID: {uid}\nAlgorithm: {algo}\n"
-        f"Subkey: {subkey_algo}\nExpire: {expire}\nProtected: {protect}{warning}",
+        f"gpg-mcp wants to create a key.\nUID: {single_line(uid)}\n"
+        f"Algorithm: {single_line(algo)}\nSubkey: {single_line(subkey_algo)}\n"
+        f"Expire: {single_line(expire)}\nProtected: {protect}{warning}",
     )
 
 
@@ -242,17 +261,26 @@ async def _ask_add_subkey(
     ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
+    fpr = require_fingerprint(fingerprint)
+    algo = validate_subkey_algo(algo)
+    expire = validate_expire(expire)
+    if usage not in {"default", "sign", "encr", "auth"}:
+        raise InputError("usage must be default, sign, encr or auth")
     return await request(
         "add_subkey",
-        f"gpg-mcp wants to add a subkey.\nFingerprint: {fingerprint}\n"
-        f"Algorithm: {algo}\nUsage: {usage}\nExpire: {expire}",
+        f"gpg-mcp wants to add a subkey.\nFingerprint: {fpr}\n"
+        f"Algorithm: {single_line(algo)}\nUsage: {single_line(usage)}\n"
+        f"Expire: {single_line(expire)}",
     )
 
 
 async def _ask_add_uid(fingerprint: str = "", uid: str = "", ctx: Context | None = None) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
+    fpr = require_fingerprint(fingerprint)
+    uid = validate_uid(uid)
     return await request(
-        "add_uid", f"gpg-mcp wants to add a UID.\nFingerprint: {fingerprint}\nUID: {uid}"
+        "add_uid",
+        f"gpg-mcp wants to add a UID.\nFingerprint: {fpr}\nUID: {single_line(uid)}",
     )
 
 
@@ -261,18 +289,21 @@ async def _ask_set_expiry(
     ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
+    fpr = require_fingerprint(fingerprint)
+    expire = validate_expire(expire)
     return await request(
         "set_expiry",
-        f"gpg-mcp wants to change key expiry.\nFingerprint: {fingerprint}\n"
-        f"Expire: {expire}\nSubkeys: {subkeys}",
+        f"gpg-mcp wants to change key expiry.\nFingerprint: {fpr}\n"
+        f"Expire: {single_line(expire)}\nSubkeys: {subkeys}",
     )
 
 
 async def _ask_change_passphrase(fingerprint: str = "", ctx: Context | None = None) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
+    fpr = require_fingerprint(fingerprint)
     return await request(
         "change_passphrase",
-        f"gpg-mcp wants to change the passphrase for {fingerprint}.\n"
+        f"gpg-mcp wants to change the passphrase for {fpr}.\n"
         "The old and new passphrases are entered only into pinentry.",
     )
 
@@ -297,9 +328,11 @@ async def _ask_set_ownertrust(
     fingerprint: str = "", level: str = "", ctx: Context | None = None
 ) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
+    fpr = require_fingerprint(fingerprint)
+    level = validate_ownertrust(level)
     return await request(
         "set_ownertrust",
-        f"gpg-mcp wants to set ownertrust.\nFingerprint: {fingerprint}\nLevel: {level}",
+        f"gpg-mcp wants to set ownertrust.\nFingerprint: {fpr}\nLevel: {level}",
     )
 
 
@@ -315,11 +348,28 @@ async def _ask_generate_revocation(fingerprint: str = "", ctx: Context | None = 
 
 async def _ask_send_key(fingerprint: str = "", ctx: Context | None = None) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
+    fpr = require_fingerprint(fingerprint)
     policy = get_policy()
+    if not policy.enable_network:
+        raise PolicyError("network operations are disabled by configuration")
     return await request(
         "send_key",
-        f"gpg-mcp wants to publish a public key.\nFingerprint: {fingerprint}\n"
-        f"Keyserver: {policy.keyserver}",
+        f"gpg-mcp wants to publish a public key.\nFingerprint: {fpr}\n"
+        f"Keyserver: {single_line(policy.keyserver, limit=200)}",
+    )
+
+
+async def _ask_fetch_key(fingerprint: str = "", ctx: Context | None = None) -> Confirm | Elicit[Confirm]:
+    set_approval_context(ctx)
+    fpr = require_fingerprint(fingerprint)
+    policy = get_policy()
+    if not policy.enable_network:
+        raise PolicyError("network operations are disabled by configuration")
+    return await request(
+        "fetch_key",
+        f"gpg-mcp wants to fetch and import a public key.\nFingerprint: {fpr}\n"
+        f"Keyserver: {single_line(policy.keyserver, limit=200)}\n"
+        "This modifies the keyring.",
     )
 
 
@@ -328,11 +378,11 @@ async def _ask_delete_key(
     ctx: Context | None = None,
 ) -> DestructiveConfirm | Elicit[DestructiveConfirm]:
     set_approval_context(ctx)
-    fpr = fingerprint.strip().upper()
+    fpr = require_fingerprint(fingerprint)
     what = "the SECRET and public key" if secret else "the public key"
     return await request_destructive(
         "delete_key",
-        f"gpg-mcp wants to DELETE {what}.\nFingerprint: {fpr}\n"
+        f"gpg-mcp wants to DELETE {what}.\nTarget: {await _key_label(fpr)}\n"
         "This cannot be undone unless you have a backup.",
         fpr,
     )
@@ -366,7 +416,7 @@ async def _ask_import_revocation(
     actual = validated["fingerprint"]
     label = actual
     if validated.get("uid"):
-        label += f" ({validated['uid']})"
+        label += f" ({single_line(validated['uid'], limit=200)})"
     action = "apply" if apply else "validate without applying"
     return await request_destructive(
         "import_revocation",
@@ -828,10 +878,25 @@ async def search_keyserver(query: str) -> dict[str, Any]:
     return await gpg().search_keyserver(query)
 
 
-@mcp.tool(annotations=NETWORK_READ)
-async def fetch_key(fingerprint: str) -> dict[str, Any]:
-    """Fetch a public key by full fingerprint from the configured keyserver."""
-    return await gpg().fetch_key(fingerprint)
+@mcp.tool(annotations=NETWORK_WRITE)
+async def fetch_key(
+    fingerprint: str,
+    approval: Annotated[ElicitationResult[Confirm], Resolve(_ask_fetch_key)] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Fetch and import a public key by full fingerprint from the configured keyserver."""
+    fpr = require_fingerprint(fingerprint)
+    decision = evaluate(approval)
+    record_decision("fetch_key", decision, fingerprint=fpr)
+    require_approved(decision, "fetch_key")
+    result = await gpg().fetch_key(fpr)
+    _audit(
+        "fetch_key",
+        fingerprint=fpr,
+        imported=result["imported_fingerprints"],
+        keyserver=get_policy().keyserver,
+        result="ok",
+    )
+    return result
 
 
 @mcp.tool(annotations=NETWORK_WRITE)

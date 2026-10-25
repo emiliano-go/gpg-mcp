@@ -110,7 +110,12 @@ def test_secret_material_detection_and_redaction() -> None:
 
 def test_default_approval_includes_revocation_and_destructive_ops(tmp_path) -> None:
     policy = _config(tmp_path, f'gnupg_home = "{tmp_path}"\n')
-    assert {"import_revocation", "delete_key", "revoke_key"} <= policy.require_approval
+    assert {
+        "import_revocation",
+        "delete_key",
+        "revoke_key",
+        "fetch_key",
+    } <= policy.require_approval
 
 
 def test_unknown_operation_requires_approval(tmp_path) -> None:
@@ -144,3 +149,76 @@ def test_all_high_risk_tools_are_registered() -> None:
     assert names - READ_ONLY_TOOLS <= ALL_OPERATIONS
     assert "import_revocation" in ALL_OPERATIONS
     assert "sign_and_encrypt" in ALL_OPERATIONS
+
+
+def test_fetch_key_is_a_write_operation() -> None:
+    from gpg_mcp.policy import ALL_OPERATIONS, READ_ONLY_TOOLS
+    from gpg_mcp.server import mcp
+
+    assert "fetch_key" in ALL_OPERATIONS
+    assert "fetch_key" not in READ_ONLY_TOOLS
+    tool = next(t for t in mcp._tool_manager.list_tools() if t.name == "fetch_key")
+    assert tool.annotations is not None
+    assert tool.annotations.read_only_hint is False
+
+
+@pytest.mark.asyncio
+async def test_destructive_confirmation_is_independent_of_require_approval(
+    tmp_path, monkeypatch
+) -> None:
+    from types import SimpleNamespace
+
+    from mcp.server.mcpserver import Elicit
+
+    from gpg_mcp.approval import (
+        DestructiveConfirm,
+        request_destructive,
+        set_approval_context,
+    )
+
+    policy = _config(
+        tmp_path,
+        f'gnupg_home = "{tmp_path}"\n'
+        'approval = "client"\n'
+        "require_approval = []\n"
+        "destructive_confirmation = true\n",
+    )
+    monkeypatch.setattr("gpg_mcp.approval.get_policy", lambda: policy)
+    ctx = SimpleNamespace(
+        session=SimpleNamespace(
+            client_params=SimpleNamespace(
+                capabilities=SimpleNamespace(elicitation=object())
+            )
+        )
+    )
+    set_approval_context(ctx)
+    try:
+        result = await request_destructive(
+            "delete_key", "delete", "A" * 32 + "ABCDEF12"
+        )
+        assert isinstance(result, Elicit)
+    finally:
+        set_approval_context(None)
+
+    opt_out = _config(
+        tmp_path,
+        f'gnupg_home = "{tmp_path}"\n'
+        'approval = "client"\n'
+        "require_approval = []\n"
+        "destructive_confirmation = false\n",
+    )
+    monkeypatch.setattr("gpg_mcp.approval.get_policy", lambda: opt_out)
+    auto = await request_destructive(
+        "delete_key", "delete", "A" * 32 + "ABCDEF12"
+    )
+    assert isinstance(auto, DestructiveConfirm)
+    assert auto.approve is True
+    assert auto.confirmation == "ABCDEF12"
+
+
+@pytest.mark.asyncio
+async def test_fetch_key_fails_before_approval_when_network_disabled() -> None:
+    from gpg_mcp import server
+
+    with pytest.raises(PolicyError):
+        await server._ask_fetch_key(fingerprint="A" * 40)

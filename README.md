@@ -50,7 +50,9 @@ fixed, typed surface with deliberate omissions:
    when the same message also has a visible allowed recipient.
 5. **Invalid embedded signatures abort decryption.** If `verify=true` (default) and the decrypted
    message carries a bad, expired or revoked signature, the plaintext is **not** returned.
-   `valid` is the policy result; the cryptographic result is reported separately.
+   `valid` is the policy result; the cryptographic result is reported separately. Multiple
+   signatures are aggregated per `NEWSIG` sequence and fail closed if **any** signature is not
+   policy-acceptable, regardless of event order.
 6. **Authorization is a fail-closed registry.** Every high-risk tool names a registered operation.
    Unknown operations require approval. Composite operations (`sign_and_encrypt`, and `encrypt`
    with `sign_with`) inherit the approval requirement of every constituent, so a policy that gates
@@ -61,6 +63,7 @@ fixed, typed surface with deliberate omissions:
    true dry run and never touches the real keyring.
 8. **Destructive operations require typed confirmation.** Deleting, revoking, or applying a
    revocation certificate requires the operator to type the last 8 characters of the fingerprint.
+   This is controlled by `destructive_confirmation` and is independent of `require_approval`.
 9. **Every high-risk operation is audited.** The ledger records operation names, fingerprints,
    payload SHA-256, size and the decision — never plaintext, payload previews or passphrases.
 10. **No shell.** Commands are `execve`-style argv arrays. No shell interpolation, no option
@@ -84,8 +87,10 @@ fixed, typed surface with deliberate omissions:
 | `valid` | alias for `policy_acceptable`, retained for compatibility |
 | `identity_trusted` | signer has full or ultimate trust; reported separately, not required for acceptance |
 
-Decryption releases plaintext only when the embedded signature is `policy_acceptable`. A
-mathematically valid but expired or revoked signature is never enough.
+Decryption releases plaintext only when every embedded signature is `policy_acceptable`. A
+mathematically valid but expired or revoked signature is never enough, and a bad signature cannot be
+hidden by a later good one. The result includes a `signatures` list with one entry per `NEWSIG`
+sequence.
 
 ### What it does **not** guarantee
 
@@ -120,6 +125,11 @@ mathematically valid but expired or revoked signature is never enough.
 | Agent hides one recipient among visible ones | Any hidden recipient is rejected unless explicitly enabled |
 | Agent substitutes a fake local approval dialog | `zenity` gets the same trusted-binary checks as gpg |
 | Agent reads plaintext from a bad signature | Bad/expired/revoked embedded signatures are not policy-acceptable and abort |
+| Agent hides a bad signature behind a later good one | Per-`NEWSIG` aggregation fails closed if any signature is unacceptable |
+| Agent fetches a key to mutate the keyring without approval | `fetch_key` is a registered write operation with approval and reports imported fingerprints |
+| Agent injects newlines or bidi text through a UID into an approval dialog | Single-line escaping plus validation before approval |
+| A pre-existing audit file is world-readable | `fstat` + `fchmod` to `0600`; non-regular/foreign-owned files are refused |
+| A destructive operation is removed from `require_approval` | `destructive_confirmation` still demands the typed suffix by default |
 | Compression bomb / huge output | Capped streaming reads; process group killed |
 | PATH hijack | Absolute binary paths, ownership/mode checks |
 | Passphrase leak through argv/env/stdin | Pinentry only; no passphrase code path |
@@ -221,6 +231,7 @@ Config path: `~/.config/gpg-mcp/config.toml`, or `--config`, or `GPG_MCP_CONFIG`
 | `gnupg_home` | `~/.local/share/gpg-mcp/gnupg` | Isolated keyring. Must be `0700`. |
 | `approval` | `client` | `client` (MCP elicitation), `local` (zenity/TTY), `none` (tests only) |
 | `require_approval` | all high-risk ops | Operations that must be approved |
+| `destructive_confirmation` | `true` | Typed fingerprint suffix for destructive ops, independent of `require_approval` |
 | `allowed_sign_keys` | `[]` | Full fingerprints allowed to sign. Empty = any in a dedicated keyring, none in `~/.gnupg` |
 | `allowed_decrypt_keys` | `[]` | Same rule for decryption |
 | `allowed_recipients` | `[]` | Optional recipient allow-list for encryption |
@@ -288,7 +299,7 @@ Network (opt-in):
 | Tool | Purpose |
 |---|---|
 | `search_keyserver` | Search the configured keyserver |
-| `fetch_key` | Fetch by full fingerprint |
+| `fetch_key` | Fetch and import a public key; approval-gated and reports imported fingerprints |
 | `send_key` | Publish a public key |
 
 ### Deliberately absent
@@ -320,6 +331,11 @@ Composite operations require approval if any constituent requires it. `sign_and_
 both `sign` and `encrypt`; `encrypt(..., sign_with=...)` inherits `sign` as well. A custom
 `require_approval = ["sign"]` therefore still gates encryption-with-signing, and
 `require_approval = ["encrypt"]` still gates `sign_and_encrypt`.
+
+Destructive operations require the typed fingerprint suffix whenever
+`destructive_confirmation = true` (the default), even if the operation was removed from
+`require_approval`. Set it to `false` only if you intentionally want to disable both the approval and
+the typed confirmation; `approval = "none"` also bypasses it for disposable test keyrings.
 
 For revocation imports, the approval form shows the identity derived from the certificate itself,
 not merely the fingerprint passed as an argument. A certificate for a different key is rejected
@@ -394,8 +410,10 @@ Every high-risk operation appends one JSON object to `audit.jsonl`:
 
 The ledger contains no plaintext, no payload previews, no passphrases and no private key material.
 Approval summaries are rendered for the human but never written to the ledger. The file is
-append-only with mode `0600`. `gpg-mcp` only tightens permissions on an audit directory it creates
-itself; it never `chmod`s an existing arbitrary parent such as `/tmp`.
+append-only with mode `0600`. On every write, an existing audit file is `fstat`ed: non-regular
+files and files owned by another user are refused, and an existing file with group/other access is
+tightened to `0600` with `fchmod`. `gpg-mcp` only tightens permissions on an audit directory it
+creates itself; it never `chmod`s an existing arbitrary parent such as `/tmp`.
 
 It is not tamper-proof against the same OS user.
 
@@ -423,6 +441,11 @@ operations. It asserts, among other things, that:
 - composite operations inherit constituent approval requirements;
 - revocation dry-runs do not modify the real keyring, and certificates for another key are rejected;
 - expired signatures, expired keys, revoked keys and missing public keys are never policy-acceptable;
+- multiple embedded signatures fail closed in both good/bad orders;
+- `fetch_key` is registered as a write operation and requires approval;
+- multiline/bidi UIDs are escaped in approval dialogs and validated before approval;
+- an existing `0644` audit file is tightened to `0600`, while symlinks and FIFOs are refused;
+- destructive confirmation remains required even when the operation is removed from `require_approval`;
 - decryption refuses ciphertext addressed to another key and mixed hidden/visible recipients;
 - the audit ledger contains no payload preview and does not change an existing directory's mode;
 - unsafe `zenity`/binary permissions are rejected;

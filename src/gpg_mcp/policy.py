@@ -76,6 +76,7 @@ OPERATIONS: dict[str, Operation] = {
     "delete_key": Operation("delete_key", destructive=True, description="Delete a key"),
     "set_ownertrust": Operation("set_ownertrust", description="Set ownertrust"),
     "send_key": Operation("send_key", description="Publish a public key"),
+    "fetch_key": Operation("fetch_key", description="Fetch and import a public key"),
 }
 
 ALL_OPERATIONS = frozenset(OPERATIONS)
@@ -92,7 +93,6 @@ READ_ONLY_TOOLS = frozenset(
         "agent_info",
         "doctor",
         "search_keyserver",
-        "fetch_key",
     }
 )
 
@@ -132,6 +132,7 @@ class Policy:
     allowed_recipients: tuple[str, ...]
     require_approval: frozenset[str]
     approval: str
+    destructive_confirmation: bool
     max_input_bytes: int
     max_output_bytes: int
     timeout_s: int
@@ -249,6 +250,9 @@ def load_policy(path: Path | None = None, *, env: dict[str, str] | None = None) 
         allowed_recipients=_as_str_tuple(raw.get("allowed_recipients"), "allowed_recipients"),
         require_approval=frozenset(require),
         approval=approval,
+        destructive_confirmation=_as_bool(
+            raw.get("destructive_confirmation", True), "destructive_confirmation"
+        ),
         max_input_bytes=_as_int(
             raw.get("max_input_bytes", 10 * 1024 * 1024),
             "max_input_bytes",
@@ -285,7 +289,7 @@ def load_policy(path: Path | None = None, *, env: dict[str, str] | None = None) 
         keyserver=_validate_keyserver(
             str(raw.get("keyserver", "hkps://keys.openpgp.org"))
         ),
-        audit_log=audit_log.resolve(),
+        audit_log=audit_log.absolute(),
         config_path=config_path.resolve(),
         raw=raw,
     )
@@ -481,12 +485,38 @@ def audit(policy: Policy, record: dict[str, Any]) -> None:
             # Never chmod an existing arbitrary parent (for example /tmp).
             parent.mkdir(parents=True, mode=0o700)
             os.chmod(parent, 0o700)
-        fd = os.open(
-            policy.audit_log,
-            os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
+        flags = (
+            os.O_APPEND
+            | os.O_CREAT
+            | os.O_WRONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
         )
+        fd = os.open(policy.audit_log, flags, 0o600)
         try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                print(
+                    "gpg-mcp: audit log is not a regular file; refusing to write",
+                    file=sys.stderr,
+                )
+                return
+            if st.st_uid != os.getuid():
+                print(
+                    "gpg-mcp: audit log is not owned by the current user; "
+                    "refusing to write",
+                    file=sys.stderr,
+                )
+                return
+            if stat.S_IMODE(st.st_mode) & 0o077:
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError as exc:
+                    print(
+                        f"gpg-mcp: cannot tighten audit log permissions: {exc}",
+                        file=sys.stderr,
+                    )
+                    return
             os.write(fd, line.encode("utf-8"))
         finally:
             os.close(fd)

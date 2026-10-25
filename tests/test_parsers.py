@@ -112,3 +112,60 @@ def test_missing_key_is_not_policy_acceptable() -> None:
     assert info["policy_acceptable"] is False
     assert info["valid"] is False
     assert info["missing_key"] is True
+
+
+MULTI_BAD_FIRST = (
+    "[GNUPG:] NEWSIG\n"
+    "[GNUPG:] BADSIG A6314C63B4A19DF3 Bad Signer\n"
+    "[GNUPG:] NEWSIG\n"
+    "[GNUPG:] GOODSIG A6314C63B4A19DF3 Good Signer\n"
+    "[GNUPG:] VALIDSIG A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B "
+    "2026-10-24 1792883400 0 5 0 22 8 00 "
+    "A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B\n"
+)
+
+MULTI_GOOD_FIRST = (
+    "[GNUPG:] NEWSIG\n"
+    "[GNUPG:] GOODSIG A6314C63B4A19DF3 Good Signer\n"
+    "[GNUPG:] VALIDSIG A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B "
+    "2026-10-24 1792883400 0 5 0 22 8 00 "
+    "A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B\n"
+    "[GNUPG:] NEWSIG\n"
+    "[GNUPG:] BADSIG A6314C63B4A19DF3 Bad Signer\n"
+)
+
+
+def test_multiple_signatures_bad_first() -> None:
+    info = _verification(parse_status(MULTI_BAD_FIRST))
+    assert info["signature_count"] == 2
+    assert info["valid"] is False
+    assert info["policy_acceptable"] is False
+    assert info["status"] == "BADSIG"
+    assert [item["status"] for item in info["signatures"]] == ["BADSIG", "GOODSIG"]
+
+
+def test_multiple_signatures_good_first() -> None:
+    info = _verification(parse_status(MULTI_GOOD_FIRST))
+    assert info["signature_count"] == 2
+    assert info["valid"] is False
+    assert info["status"] == "BADSIG"
+    assert [item["status"] for item in info["signatures"]] == ["GOODSIG", "BADSIG"]
+
+
+def test_multiple_good_signatures_are_acceptable() -> None:
+    two_good = (
+        "[GNUPG:] NEWSIG\n"
+        "[GNUPG:] GOODSIG A6314C63B4A19DF3 One\n"
+        "[GNUPG:] VALIDSIG A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B "
+        "2026-10-24 1792883400 0 5 0 22 8 00 "
+        "A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B\n"
+        "[GNUPG:] NEWSIG\n"
+        "[GNUPG:] GOODSIG B6314C63B4A19DF3 Two\n"
+        "[GNUPG:] VALIDSIG B6314C63B4A19DF3CDC098D97DE1AEEAAC04693B "
+        "2026-10-24 1792883400 0 5 0 22 8 00 "
+        "B6314C63B4A19DF3CDC098D97DE1AEEAAC04693B\n"
+    )
+    info = _verification(parse_status(two_good))
+    assert info["signature_count"] == 2
+    assert info["valid"] is True
+    assert info["status"] == "GOODSIG"

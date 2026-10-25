@@ -25,7 +25,7 @@ from mcp.server.mcpserver import (
 from pydantic import BaseModel, Field
 
 from .binaries import secure_binary
-from .errors import GpgMcpError
+from .errors import GpgMcpError, single_line
 from .policy import (
     Operation,
     assert_registered_operation,
@@ -79,7 +79,7 @@ def payload_summary(action: str, data: bytes, *, key: str = "", extra: str = "")
     try:
         text = data[:200].decode("utf-8")
         if text.isprintable() and "\x00" not in text:
-            preview = "\nPreview: " + text.replace("\n", "\\n")[:120]
+            preview = "\nPreview: " + single_line(text, limit=120)
     except UnicodeDecodeError:
         pass
     parts = [
@@ -238,12 +238,12 @@ async def request_destructive(
         )
     policy, required = _required_operations([op])
     suffix = fingerprint[-8:].upper()
-    if not required:
-        # Explicit configuration opt-out. The default policy requires this.
+    if not required and not policy.destructive_confirmation:
+        # Explicit opt-out from both approval and typed confirmation.
         _audit_approval(policy, [op], "configured_skip", destructive=True)
         return DestructiveConfirm(approve=True, confirmation=suffix)
     if policy.approval == "none":
-        _audit_approval(policy, required, "skipped", destructive=True)
+        _audit_approval(policy, required or [op], "skipped", destructive=True)
         return DestructiveConfirm(approve=True, confirmation=suffix)
     fallback = policy.approval != "local" and not _client_can_elicit()
     if policy.approval == "local" or fallback:
@@ -259,7 +259,7 @@ async def request_destructive(
         decision = ("local_fallback_" if fallback else "local_") + (
             "accept" if ok else "decline"
         )
-        _audit_approval(policy, required, decision, destructive=True)
+        _audit_approval(policy, required or [op], decision, destructive=True)
         return DestructiveConfirm(approve=ok, confirmation=typed or "")
     return Elicit(
         f"{summary}\n\nThis is destructive. Type the last 8 characters of the "

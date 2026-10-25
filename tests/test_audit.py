@@ -71,3 +71,40 @@ async def test_audit_contains_no_payload_preview(monkeypatch, tmp_path, keyring,
     finally:
         reset_policy_cache()
         reset_gpg()
+
+
+def test_audit_tightens_existing_file(tmp_path) -> None:
+    parent = tmp_path / "permissions"
+    parent.mkdir()
+    os.chmod(parent, 0o755)
+    log = parent / "audit.jsonl"
+    log.write_text("existing\n", encoding="utf-8")
+    os.chmod(log, 0o644)
+    policy = _policy(tmp_path, str(log))
+    audit(policy, {"event": "test"})
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600
+    assert "existing" in log.read_text(encoding="utf-8")
+    reset_policy_cache()
+
+
+def test_audit_refuses_symlink(tmp_path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("keep", encoding="utf-8")
+    link = tmp_path / "audit.jsonl"
+    link.symlink_to(target)
+    policy = _policy(tmp_path, str(link))
+    audit(policy, {"event": "test"})
+    assert target.read_text(encoding="utf-8") == "keep"
+    reset_policy_cache()
+
+
+def test_audit_refuses_fifo_without_blocking(tmp_path) -> None:
+    parent = tmp_path / "fifo"
+    parent.mkdir()
+    fifo = parent / "audit.jsonl"
+    os.mkfifo(fifo)
+    policy = _policy(tmp_path, str(fifo))
+    audit(policy, {"event": "test"})
+    assert fifo.exists()
+    reset_policy_cache()

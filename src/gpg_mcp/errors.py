@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 from mcp.server.mcpserver.exceptions import ToolError
@@ -23,6 +24,34 @@ def sanitize_text(text: str, *, limit: int = 200_000) -> str:
     if not text:
         return text
     return _CONTROL_RE.sub("", _ANSI_RE.sub("", text))[:limit]
+
+
+def single_line(text: str, *, limit: int = 512) -> str:
+    """Render untrusted text safely inside a one-line approval dialog.
+
+    Newlines, carriage returns, tabs, backslashes, ANSI escapes and Unicode
+    format/line-separator characters are escaped so a crafted UID cannot forge
+    a second line or visually reorder the dialog.
+    """
+    if not text:
+        return text
+    cleaned = sanitize_text(text, limit=limit * 4)
+    escaped: list[str] = []
+    for ch in cleaned:
+        category = unicodedata.category(ch)
+        if ch == "\\":
+            escaped.append("\\\\")
+        elif ch == "\n":
+            escaped.append("\\n")
+        elif ch == "\r":
+            escaped.append("\\r")
+        elif ch == "\t":
+            escaped.append("\\t")
+        elif category in {"Cf", "Cc", "Zl", "Zp"}:
+            escaped.append(f"\\u{ord(ch):04x}")
+        else:
+            escaped.append(ch)
+    return "".join(escaped)[:limit]
 
 
 def contains_secret_material(text: str) -> bool:
