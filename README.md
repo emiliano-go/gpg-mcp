@@ -74,7 +74,21 @@ fixed, typed surface with deliberate omissions:
     must be regular files, and must not be group/world writable. An unsafe `zenity` makes local
     approval fail closed instead of trusting a substituted dialog.
 13. **Bounded resources.** Input/output size caps, per-operation timeouts, a dedicated process
-    group killed on timeout, and a 0700 temporary directory with 0600 files.
+    group killed on timeout, and a 0700 temporary directory with 0600 files. Status output that
+    exceeds `max_status_bytes` fails closed instead of being parsed partially.
+14. **The generic importer cannot revoke.** `import_public_key` rejects secret-key packets and any
+    revocation signature, including revocation signatures embedded in key material. Revocations
+    must use `import_revocation`, where the target is validated and typed confirmation is required.
+15. **The actual decryption key is checked.** After decryption, the `DECRYPTION_KEY` status must
+    name an allowed primary or subkey; otherwise the plaintext is discarded. A ciphertext with an
+    allowed visible recipient cannot silently decrypt through a different secret key.
+16. **GnuPG configuration is deterministic.** The runner uses `--no-options` and
+    `--pinentry-mode ask`, so a hostile `gpg.conf` cannot switch on loopback pinentry or change
+    other security-relevant defaults.
+17. **Configuration and audit files are checked.** The config must be a regular file owned by the
+    current user and not group/world-writable; unknown keys are rejected. Existing audit files are
+    `fstat`ed, non-regular/foreign-owned files are refused, and group/other access is tightened to
+    `0600`. With `audit_required = true`, an audit failure fails the operation.
 
 ### Verification result semantics
 
@@ -130,6 +144,12 @@ sequence.
 | Agent injects newlines or bidi text through a UID into an approval dialog | Single-line escaping plus validation before approval |
 | A pre-existing audit file is world-readable | `fstat` + `fchmod` to `0600`; non-regular/foreign-owned files are refused |
 | A destructive operation is removed from `require_approval` | `destructive_confirmation` still demands the typed suffix by default |
+| A revocation certificate is submitted through the generic importer | Packet-level revocation-signature rejection; use `import_revocation` |
+| Decryption silently uses a non-allow-listed secret key | `DECRYPTION_KEY` status is checked; plaintext is discarded on mismatch |
+| A huge/incomplete status file is treated as success | `max_status_bytes` is enforced; partial status fails closed |
+| A hostile `gpg.conf` changes runner behavior | `--no-options` and explicit `--pinentry-mode ask` |
+| A group/world-writable config changes policy | Config integrity checks reject unsafe files and unknown keys |
+| An audit write fails silently | `audit_required = true` fails the operation |
 | Compression bomb / huge output | Capped streaming reads; process group killed |
 | PATH hijack | Absolute binary paths, ownership/mode checks |
 | Passphrase leak through argv/env/stdin | Pinentry only; no passphrase code path |
@@ -232,6 +252,8 @@ Config path: `~/.config/gpg-mcp/config.toml`, or `--config`, or `GPG_MCP_CONFIG`
 | `approval` | `client` | `client` (MCP elicitation), `local` (zenity/TTY), `none` (tests only) |
 | `require_approval` | all high-risk ops | Operations that must be approved |
 | `destructive_confirmation` | `true` | Typed fingerprint suffix for destructive ops, independent of `require_approval` |
+| `allow_test_mode` | `false` | Required to use `approval = "none"` at serve time |
+| `audit_required` | `true` | Fail high-risk operations if the audit ledger cannot be written |
 | `allowed_sign_keys` | `[]` | Full fingerprints allowed to sign. Empty = any in a dedicated keyring, none in `~/.gnupg` |
 | `allowed_decrypt_keys` | `[]` | Same rule for decryption |
 | `allowed_recipients` | `[]` | Optional recipient allow-list for encryption |
@@ -240,7 +262,6 @@ Config path: `~/.config/gpg-mcp/config.toml`, or `--config`, or `GPG_MCP_CONFIG`
 | `enable_symmetric` | `false` | Symmetric encrypt/decrypt |
 | `allow_unprotected_keys` | `false` | Permit `protect=false` key creation (test keyrings only) |
 | `allow_hidden_recipients` | `false` | Permit decryption of hidden-recipient messages |
-| `allow_secret_import` | `false` | Never enable in production |
 | `max_input_bytes` | `10485760` | Input cap |
 | `max_output_bytes` | `20971520` | Output cap |
 | `timeout_s` | `120` | Per-operation timeout |
@@ -349,7 +370,9 @@ use a second `zenity --entry` prompt for the fingerprint suffix.
 
 ### `none`
 
-For disposable test keyrings only. The audit ledger records `decision: skipped`.
+For disposable test keyrings only. `serve` refuses this mode unless `allow_test_mode = true`
+(or `GPG_MCP_ALLOW_TEST_MODE=1`) **and** a dedicated `GNUPGHOME` are configured. The audit ledger
+records `decision: skipped`. Never enable it for real keys.
 
 ---
 
@@ -415,7 +438,9 @@ files and files owned by another user are refused, and an existing file with gro
 tightened to `0600` with `fchmod`. `gpg-mcp` only tightens permissions on an audit directory it
 creates itself; it never `chmod`s an existing arbitrary parent such as `/tmp`.
 
-It is not tamper-proof against the same OS user.
+With `audit_required = true` (the default), a high-risk operation fails if the audit entry cannot be
+written; set `audit_required = false` only for disposable test keyrings. The ledger is not
+tamper-proof against the same OS user.
 
 ---
 
@@ -446,6 +471,14 @@ operations. It asserts, among other things, that:
 - multiline/bidi UIDs are escaped in approval dialogs and validated before approval;
 - an existing `0644` audit file is tightened to `0600`, while symlinks and FIFOs are refused;
 - destructive confirmation remains required even when the operation is removed from `require_approval`;
+- a revocation certificate cannot revoke through `import_public_key`;
+- the actual `DECRYPTION_KEY` must be allow-listed;
+- status output over the configured limit fails closed;
+- a hostile `gpg.conf` is ignored;
+- unsafe config files, unknown config keys, and implicit `approval="none"` are rejected;
+- unsafe audit files raise when `audit_required=true`;
+- key-generation combinations are validated and partial imports are classified;
+- the tool registry matches the read/write annotations for every exposed tool;
 - decryption refuses ciphertext addressed to another key and mixed hidden/visible recipients;
 - the audit ledger contains no payload preview and does not change an existing directory's mode;
 - unsafe `zenity`/binary permissions are rejected;
@@ -464,7 +497,13 @@ CI runs `ruff` and `pytest` on Python 3.11, 3.12 and 3.13 with GnuPG installed (
   keyring; revocation certificates for unknown keys are rejected. `import_revocation` handles full
   primary-key revocation, not selective subkey or UID revocation.
 - Smartcard key generation and PIN management are intentionally out of scope.
-- `approval = "client"` depends on the client rendering elicitation forms honestly.
+- `approval = "client"` depends on the client rendering elicitation forms honestly. If the client
+  cannot elicit, approval falls back to a validated local `zenity` dialog.
+- Linux/Unix only: the implementation relies on Unix permissions, `os.getuid`, POSIX process groups,
+  and `zenity`; Windows is not supported.
+- `generate_revocation` returns a revocation-capable certificate to the caller. Treat the result as
+  sensitive and store it offline. The approval prompt explains the consequence.
+- `import_revocation` handles full primary-key revocation, not selective subkey or UID revocation.
 
 ---
 

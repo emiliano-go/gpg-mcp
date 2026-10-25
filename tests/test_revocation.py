@@ -167,3 +167,18 @@ async def test_rejects_malformed_certificate(connect) -> None:
         )
         assert result.is_error
         ok(await call(client, "delete_key", fingerprint=fpr, secret=True))
+
+
+@pytest.mark.asyncio
+async def test_generic_import_cannot_apply_revocation(connect) -> None:
+    async with connect() as client:
+        fpr = await _create(client, "Import Bypass")
+        cert = ok(await call(client, "generate_revocation", fingerprint=fpr))[
+            "revocation_certificate"
+        ]
+        result = await call(client, "import_public_key", key=cert)
+        assert result.is_error
+        assert "import_revocation" in result.content[0].text
+        key = ok(await call(client, "get_key", fingerprint=fpr))["key"]
+        assert key["validity"] != "revoked"
+        ok(await call(client, "delete_key", fingerprint=fpr, secret=True))

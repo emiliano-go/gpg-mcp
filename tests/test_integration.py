@@ -105,6 +105,9 @@ async def test_encrypt_decrypt(connect, keyring) -> None:
         decrypted = ok(await call(client, "decrypt", ciphertext=ciphertext))
         assert decrypted["plaintext"] == {"text": "top secret"}
         assert decrypted["signed"] is False
+        assert decrypted["actual_keys"]
+        assert decrypted["actual_keys"][0]["primary_fingerprint"] == keyring.fpr
+        assert decrypted["decryption_keys"] == [keyring.fpr]
 
 
 @pytest.mark.asyncio
@@ -252,4 +255,36 @@ async def test_key_management_and_revocation(connect) -> None:
         after = ok(await call(client, "get_key", fingerprint=fpr))["key"]
         assert after["validity"] == "revoked"
 
+        ok(await call(client, "delete_key", fingerprint=fpr, secret=True))
+
+
+@pytest.mark.asyncio
+async def test_key_algorithm_combinations(connect) -> None:
+    async with connect() as client:
+        bad = await call(
+            client,
+            "create_key",
+            uid="Bad Combo <bad@example.com>",
+            algo="ed25519",
+            subkey_algo="rsa3072",
+            protect=False,
+        )
+        assert bad.is_error
+        assert "cv25519" in bad.content[0].text
+
+        good = ok(
+            await call(
+                client,
+                "create_key",
+                uid="RSA ECDH <rsa@example.com>",
+                algo="rsa3072",
+                subkey_algo="cv25519",
+                protect=False,
+            )
+        )
+        fpr = good["fingerprint"]
+        assert good["generated"]["primary"].startswith("RSA")
+        assert good["generated"]["subkeys"] == ["ECDH"]
+        key = ok(await call(client, "get_key", fingerprint=fpr))["key"]
+        assert key["subkeys"][0]["algorithm"] == "ECDH"
         ok(await call(client, "delete_key", fingerprint=fpr, secret=True))

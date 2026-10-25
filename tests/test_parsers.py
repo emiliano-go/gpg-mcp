@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from gpg_mcp.gpg import _verification, parse_colon_keys, parse_status
 
 COLONS = """\
@@ -169,3 +171,126 @@ def test_multiple_good_signatures_are_acceptable() -> None:
     assert info["signature_count"] == 2
     assert info["valid"] is True
     assert info["status"] == "GOODSIG"
+
+
+def test_actual_decryption_key_must_be_allowed() -> None:
+    from gpg_mcp.errors import GpgMcpError, PolicyError
+    from gpg_mcp.gpg import Gpg, StatusEvent
+
+    status = [
+        StatusEvent("DECRYPTION_KEY", ["B" * 40, "B" * 40, "u"], ""),
+    ]
+    preflight = {"public_key_ids": ["AAAAAAAAAAAAAAAA"], "symmetric": False}
+    try:
+        Gpg._check_decryption_key(None, status, ["A" * 40], preflight)
+    except PolicyError as exc:
+        assert "outside the allow-list" in str(exc)
+    else:
+        raise AssertionError("unauthorised decryption key was accepted")
+
+    allowed = Gpg._check_decryption_key(
+        None,
+        [StatusEvent("DECRYPTION_KEY", ["A" * 40, "A" * 40, "u"], "")],
+        ["A" * 40],
+        preflight,
+    )
+    assert allowed[0]["primary_fingerprint"] == "A" * 40
+
+    try:
+        Gpg._check_decryption_key(None, [], ["A" * 40], preflight)
+    except GpgMcpError as exc:
+        assert "did not report" in str(exc)
+    else:
+        raise AssertionError("missing decryption-key status was accepted")
+
+
+def test_status_file_limit_fails_closed(tmp_path) -> None:
+    from gpg_mcp.errors import OutputLimitError
+    from gpg_mcp.gpg import read_status_file
+
+    path = tmp_path / "status"
+    path.write_text("[GNUPG:] GOODSIG " + "A" * 100, encoding="utf-8")
+    with pytest.raises(OutputLimitError):
+        read_status_file(path, 10)
+    assert read_status_file(path, 10_000).startswith("[GNUPG:]")
+
+
+def test_recipient_packets_ignore_signature_issuers() -> None:
+    from gpg_mcp.gpg import parse_recipient_packets
+
+    signed_only = (
+        ":signature packet: algo 22, keyid A6314C63B4A19DF3\n"
+        "\tversion 4, created 1792883651, sigclass 0x00\n"
+    )
+    parsed = parse_recipient_packets(signed_only)
+    assert parsed["encrypted"] is False
+    assert parsed["public_key_ids"] == []
+
+    encrypted = (
+        ":pubkey enc packet: version 3, algo 18, keyid CEE0253087DC02F4\n"
+        ":encrypted data packet:\n"
+    )
+    parsed = parse_recipient_packets(encrypted)
+    assert parsed["encrypted"] is True
+    assert parsed["public_key_ids"] == ["CEE0253087DC02F4"]
+
+    symmetric = ":symkey enc packet: version 4\n"
+    parsed = parse_recipient_packets(symmetric)
+    assert parsed["encrypted"] is True
+    assert parsed["symmetric"] is True
+
+
+def test_capability_case_is_preserved() -> None:
+    text = (
+        "pub:u:255:22:AAAA:1:2::u:::sc:::::ed25519::\n"
+        "fpr:::::::::A" * 40 + ":\n"
+        "sub:u:255:18:BBBB:1:2:::::e:::::cv25519::\n"
+        "fpr:::::::::B" * 40 + ":\n"
+    )
+    key = parse_colon_keys(text)[0]
+    assert key["capabilities"]["encrypt"] is False
+    assert key["capabilities"]["usable_encrypt"] is False
+    assert key["subkeys"][0]["capabilities"]["encrypt"] is True
+    assert key["subkeys"][0]["capabilities"]["usable_encrypt"] is False
+
+
+def test_trust_fully_is_identity_trusted() -> None:
+    status = parse_status(
+        "[GNUPG:] NEWSIG\n"
+        "[GNUPG:] GOODSIG A6314C63B4A19DF3 Test\n"
+        "[GNUPG:] VALIDSIG A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B "
+        "2026-10-24 1792883400 0 5 0 22 8 00 "
+        "A6314C63B4A19DF3CDC098D97DE1AEEAAC04693B\n"
+        "[GNUPG:] TRUST_FULLY 0 pgp\n"
+    )
+    info = _verification(status)
+    assert info["trust"] == "full"
+    assert info["identity_trusted"] is True
+
+
+def test_import_result_states() -> None:
+    from gpg_mcp.gpg import GpgResult, StatusEvent, _import_summary, import_result
+
+    complete = GpgResult(
+        argv=[],
+        returncode=0,
+        stdout=b"",
+        stderr="",
+        status=[StatusEvent("IMPORT_OK", ["0", "A" * 40], "")],
+    )
+    assert import_result(complete, _import_summary(complete.status))["status"] == "complete"
+
+    partial = GpgResult(
+        argv=[],
+        returncode=2,
+        stdout=b"",
+        stderr="",
+        status=[
+            StatusEvent("IMPORT_OK", ["0", "A" * 40], ""),
+            StatusEvent("IMPORT_PROBLEM", ["1"], ""),
+        ],
+    )
+    assert import_result(partial, _import_summary(partial.status))["status"] == "partial"
+
+    failed = GpgResult(argv=[], returncode=2, stdout=b"", stderr="", status=[])
+    assert import_result(failed, _import_summary(failed.status))["status"] == "failed"

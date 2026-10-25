@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -13,7 +14,9 @@ from .gpg import Gpg
 from .policy import (
     DEFAULT_CONFIG,
     DEFAULT_GNUPG_HOME,
+    assert_config_file,
     assert_keyring_permissions,
+    assert_production_policy,
     get_policy,
     load_policy,
 )
@@ -34,11 +37,12 @@ DEFAULT_CONFIG_TEXT = """\
 gnupg_home = "{home}"
 approval = "client"                 # client | local | none
 destructive_confirmation = true     # typed fingerprint suffix, independent of require_approval
+allow_test_mode = false             # required for approval = "none"
+audit_required = true               # refuse high-risk operations if the ledger cannot be written
 enable_network = false
 enable_symmetric = false
 allow_unprotected_keys = false
 allow_hidden_recipients = false
-allow_secret_import = false
 max_input_bytes = 10485760
 max_output_bytes = 20971520
 timeout_s = 120
@@ -50,7 +54,6 @@ keyserver = "hkps://keys.openpgp.org"
 # allowed_sign_keys = ["FULL40HEXFINGERPRINT"]
 # allowed_decrypt_keys = ["FULL40HEXFINGERPRINT"]
 # allowed_recipients = ["FULL40HEXFINGERPRINT"]
-# default_sign_key = "FULL40HEXFINGERPRINT"
 """
 
 
@@ -63,18 +66,28 @@ def _set_env(config: str | None, home: str | None) -> None:
 
 def cmd_init(args: argparse.Namespace) -> int:
     home = Path(os.path.expanduser(args.home or str(DEFAULT_GNUPG_HOME))).resolve()
-    config = Path(os.path.expanduser(args.config or str(DEFAULT_CONFIG))).resolve()
+    config = Path(os.path.expanduser(args.config or str(DEFAULT_CONFIG))).absolute()
     home.mkdir(parents=True, exist_ok=True)
     os.chmod(home, 0o700)
     agent_conf = home / "gpg-agent.conf"
     if not agent_conf.exists():
         agent_conf.write_text(AGENT_CONF, encoding="utf-8")
     os.chmod(agent_conf, 0o600)
-    config.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(config.parent, 0o700)
+    if not config.parent.exists():
+        config.parent.mkdir(parents=True, mode=0o700)
+        os.chmod(config.parent, 0o700)
     if not config.exists():
         config.write_text(DEFAULT_CONFIG_TEXT.format(home=home), encoding="utf-8")
+    st = config.lstat()
+    if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid():
         os.chmod(config, 0o600)
+    else:
+        print(
+            "gpg-mcp: config is not a regular file owned by the current user; "
+            "not changing its permissions",
+            file=sys.stderr,
+        )
+    assert_config_file(config)
     print(f"keyring: {home}")
     print(f"config:  {config}")
     print()
@@ -104,6 +117,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     _set_env(args.config, args.home)
     policy = load_policy()
+    assert_production_policy(policy)
+    if policy.approval == "none":
+        print(
+            "gpg-mcp: WARNING approval is disabled (test mode) for "
+            f"{policy.gnupg_home}",
+            file=sys.stderr,
+        )
     assert_keyring_permissions(policy.gnupg_home)
     reset_gpg()
 

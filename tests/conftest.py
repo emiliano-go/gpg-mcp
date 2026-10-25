@@ -28,7 +28,6 @@ enable_network = false
 enable_symmetric = false
 allow_unprotected_keys = true
 allow_hidden_recipients = false
-allow_secret_import = false
 max_input_bytes = 1048576
 max_output_bytes = 2097152
 timeout_s = 60
@@ -109,6 +108,7 @@ def keyring(tmp_path_factory: pytest.TempPathFactory) -> Keyring:
     fpr2 = _generate(home, "Test Two", "two@example.com")
     config = base / "config.toml"
     config.write_text(CONFIG.format(home=home, base=base), encoding="utf-8")
+    os.chmod(config, 0o600)
     os.environ["GPG_MCP_CONFIG"] = str(config)
     os.environ["GPG_MCP_HOME"] = str(home)
     reset_policy_cache()

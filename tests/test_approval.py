@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 
 import pytest
@@ -23,6 +24,7 @@ def _approval_config(keyring, mode: str = "client"):
         "allow_unprotected_keys = true\n",
         encoding="utf-8",
     )
+    os.chmod(path, 0o600)
     return path
 
 
@@ -178,6 +180,7 @@ def composite_env(monkeypatch, keyring):
             f"require_approval = {required!r}\n",
             encoding="utf-8",
         )
+        os.chmod(path, 0o600)
         monkeypatch.setenv("GPG_MCP_CONFIG", str(path))
         reset_policy_cache()
         reset_gpg()

@@ -144,3 +144,7 @@ class TimeoutError_(GpgMcpError):
 
 class OutputLimitError(GpgMcpError):
     code = "output_too_large"
+
+
+class AuditError(GpgMcpError):
+    code = "audit_unavailable"

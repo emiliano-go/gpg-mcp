@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from .errors import InputError, PolicyError
+from .errors import AuditError, InputError, PolicyError
 
 USER_GNUPG_HOME = (Path.home() / ".gnupg").resolve()
 DEFAULT_GNUPG_HOME = (Path.home() / ".local" / "share" / "gpg-mcp" / "gnupg").resolve()
@@ -43,11 +43,35 @@ class Operation:
 
     name: str
     destructive: bool = False
+    read_only: bool = False
+    network: bool = False
     constituents: tuple[str, ...] = ()
     description: str = ""
 
 
 OPERATIONS: dict[str, Operation] = {
+    "list_keys": Operation("list_keys", read_only=True, description="List keys"),
+    "get_key": Operation("get_key", read_only=True, description="Get key metadata"),
+    "export_public_key": Operation(
+        "export_public_key", read_only=True, description="Export a public key"
+    ),
+    "export_ssh_key": Operation(
+        "export_ssh_key", read_only=True, description="Export an SSH public key"
+    ),
+    "inspect": Operation("inspect", read_only=True, description="Inspect OpenPGP data"),
+    "inspect_recipients": Operation(
+        "inspect_recipients", read_only=True, description="Inspect recipients"
+    ),
+    "verify": Operation("verify", read_only=True, description="Verify a signature"),
+    "card_status": Operation("card_status", read_only=True, description="Smartcard status"),
+    "agent_info": Operation("agent_info", read_only=True, description="Agent information"),
+    "doctor": Operation("doctor", read_only=True, description="Health checks"),
+    "search_keyserver": Operation(
+        "search_keyserver",
+        read_only=True,
+        network=True,
+        description="Search a keyserver",
+    ),
     "sign": Operation("sign", description="Sign data"),
     "encrypt": Operation("encrypt", description="Encrypt data"),
     "sign_and_encrypt": Operation(
@@ -75,25 +99,20 @@ OPERATIONS: dict[str, Operation] = {
     "revoke_key": Operation("revoke_key", destructive=True, description="Revoke a key"),
     "delete_key": Operation("delete_key", destructive=True, description="Delete a key"),
     "set_ownertrust": Operation("set_ownertrust", description="Set ownertrust"),
-    "send_key": Operation("send_key", description="Publish a public key"),
-    "fetch_key": Operation("fetch_key", description="Fetch and import a public key"),
+    "send_key": Operation(
+        "send_key", network=True, description="Publish a public key"
+    ),
+    "fetch_key": Operation(
+        "fetch_key", network=True, description="Fetch and import a public key"
+    ),
 }
 
 ALL_OPERATIONS = frozenset(OPERATIONS)
+APPROVAL_OPERATIONS = frozenset(
+    name for name, spec in OPERATIONS.items() if not spec.read_only
+)
 READ_ONLY_TOOLS = frozenset(
-    {
-        "list_keys",
-        "get_key",
-        "export_public_key",
-        "export_ssh_key",
-        "inspect",
-        "inspect_recipients",
-        "verify",
-        "card_status",
-        "agent_info",
-        "doctor",
-        "search_keyserver",
-    }
+    name for name, spec in OPERATIONS.items() if spec.read_only
 )
 
 
@@ -118,6 +137,8 @@ def requires_approval(policy: Policy, name: str) -> bool:
     spec = OPERATIONS.get(name)
     if spec is None:
         return True
+    if spec.read_only:
+        return False
     if name in policy.require_approval:
         return True
     return any(requires_approval(policy, constituent) for constituent in spec.constituents)
@@ -126,13 +147,14 @@ def requires_approval(policy: Policy, name: str) -> bool:
 @dataclass(frozen=True)
 class Policy:
     gnupg_home: Path
-    default_sign_key: str | None
     allowed_sign_keys: tuple[str, ...]
     allowed_decrypt_keys: tuple[str, ...]
     allowed_recipients: tuple[str, ...]
     require_approval: frozenset[str]
     approval: str
     destructive_confirmation: bool
+    allow_test_mode: bool
+    audit_required: bool
     max_input_bytes: int
     max_output_bytes: int
     timeout_s: int
@@ -141,7 +163,6 @@ class Policy:
     enable_symmetric: bool
     allow_unprotected_keys: bool
     allow_hidden_recipients: bool
-    allow_secret_import: bool
     keyserver: str
     audit_log: Path
     config_path: Path
@@ -170,13 +191,11 @@ def _as_bool(value: Any, key: str) -> bool:
 
 
 def _as_int(value: Any, key: str, *, minimum: int, maximum: int) -> int:
-    try:
-        n = int(value)
-    except (TypeError, ValueError) as exc:
-        raise InputError(f"config {key!r} must be an integer") from exc
-    if not minimum <= n <= maximum:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InputError(f"config {key!r} must be an integer")
+    if not minimum <= value <= maximum:
         raise InputError(f"config {key!r} must be between {minimum} and {maximum}")
-    return n
+    return value
 
 
 def _as_str_tuple(value: Any, key: str) -> tuple[str, ...]:
@@ -206,6 +225,59 @@ def _validate_keyserver(value: str) -> str:
     return value
 
 
+KNOWN_CONFIG_KEYS = {
+    "gnupg_home",
+    "audit_log",
+    "approval",
+    "require_approval",
+    "destructive_confirmation",
+    "allow_test_mode",
+    "allowed_sign_keys",
+    "allowed_decrypt_keys",
+    "allowed_recipients",
+    "max_input_bytes",
+    "max_output_bytes",
+    "timeout_s",
+    "keygen_timeout_s",
+    "enable_network",
+    "enable_symmetric",
+    "allow_unprotected_keys",
+    "allow_hidden_recipients",
+    "audit_required",
+    "keyserver",
+}
+
+
+def assert_config_file(path: Path) -> None:
+    """Reject a config file that another user could change."""
+    if not path.exists():
+        return
+    st = path.lstat()
+    if stat.S_ISLNK(st.st_mode):
+        raise PolicyError("config file must not be a symlink")
+    if not stat.S_ISREG(st.st_mode):
+        raise PolicyError("config file must be a regular file")
+    if st.st_uid != os.getuid():
+        raise PolicyError("config file must be owned by the current user")
+    if stat.S_IMODE(st.st_mode) & 0o022:
+        raise PolicyError("config file must not be group/world writable")
+
+
+def assert_production_policy(policy: Policy) -> None:
+    """Refuse approval='none' at serve time unless explicitly opted in."""
+    if policy.approval != "none":
+        return
+    if not policy.allow_test_mode:
+        raise PolicyError(
+            "approval='none' requires allow_test_mode=true or "
+            "GPG_MCP_ALLOW_TEST_MODE=1"
+        )
+    if not policy.dedicated_home:
+        raise PolicyError(
+            "approval='none' is only allowed with a dedicated GNUPGHOME"
+        )
+
+
 def load_policy(path: Path | None = None, *, env: dict[str, str] | None = None) -> Policy:
     """Load config from TOML and environment. Environment wins over the file."""
     global _CACHED
@@ -215,10 +287,14 @@ def load_policy(path: Path | None = None, *, env: dict[str, str] | None = None) 
     )
     raw: dict[str, Any] = {}
     if config_path.exists():
+        assert_config_file(config_path)
         with config_path.open("rb") as fh:
             raw = tomllib.load(fh)
         if not isinstance(raw, dict):
             raise InputError("config root must be a table")
+        unknown = set(raw) - KNOWN_CONFIG_KEYS
+        if unknown:
+            raise InputError(f"unknown config keys: {sorted(unknown)}")
 
     home = _expand(
         env.get("GPG_MCP_HOME", raw.get("gnupg_home")), "gnupg_home", DEFAULT_GNUPG_HOME
@@ -231,7 +307,7 @@ def load_policy(path: Path | None = None, *, env: dict[str, str] | None = None) 
     if approval not in _APPROVAL_MODES:
         raise InputError(f"approval must be one of {sorted(_APPROVAL_MODES)}")
 
-    require = raw.get("require_approval", sorted(ALL_OPERATIONS))
+    require = raw.get("require_approval", sorted(APPROVAL_OPERATIONS))
     if not isinstance(require, list) or not all(isinstance(v, str) for v in require):
         raise InputError("require_approval must be a list of operation names")
     unknown = set(require) - ALL_OPERATIONS
@@ -240,9 +316,6 @@ def load_policy(path: Path | None = None, *, env: dict[str, str] | None = None) 
 
     policy = Policy(
         gnupg_home=home.resolve(),
-        default_sign_key=(
-            str(raw["default_sign_key"]).strip().upper() if raw.get("default_sign_key") else None
-        ),
         allowed_sign_keys=_as_str_tuple(raw.get("allowed_sign_keys"), "allowed_sign_keys"),
         allowed_decrypt_keys=_as_str_tuple(
             raw.get("allowed_decrypt_keys"), "allowed_decrypt_keys"
@@ -252,6 +325,14 @@ def load_policy(path: Path | None = None, *, env: dict[str, str] | None = None) 
         approval=approval,
         destructive_confirmation=_as_bool(
             raw.get("destructive_confirmation", True), "destructive_confirmation"
+        ),
+        allow_test_mode=_as_bool(
+            env.get("GPG_MCP_ALLOW_TEST_MODE", raw.get("allow_test_mode", False)),
+            "allow_test_mode",
+        ),
+        audit_required=_as_bool(
+            env.get("GPG_MCP_AUDIT_REQUIRED", raw.get("audit_required", True)),
+            "audit_required",
         ),
         max_input_bytes=_as_int(
             raw.get("max_input_bytes", 10 * 1024 * 1024),
@@ -283,9 +364,6 @@ def load_policy(path: Path | None = None, *, env: dict[str, str] | None = None) 
         allow_hidden_recipients=_as_bool(
             raw.get("allow_hidden_recipients", False), "allow_hidden_recipients"
         ),
-        allow_secret_import=_as_bool(
-            raw.get("allow_secret_import", False), "allow_secret_import"
-        ),
         keyserver=_validate_keyserver(
             str(raw.get("keyserver", "hkps://keys.openpgp.org"))
         ),
@@ -302,8 +380,6 @@ def load_policy(path: Path | None = None, *, env: dict[str, str] | None = None) 
         for value in values:
             if not _FPR_RE.match(value):
                 raise InputError(f"{name} contains an invalid fingerprint: {value!r}")
-    if policy.default_sign_key and not _FPR_RE.match(policy.default_sign_key):
-        raise InputError("default_sign_key must be a full fingerprint")
 
     _CACHED = policy
     return policy
@@ -375,6 +451,27 @@ def validate_subkey_algo(value: str) -> str:
     return algo
 
 
+def validate_key_algorithms(algo: str, subkey_algo: str) -> tuple[str, str]:
+    """Validate a primary/subkey combination before approval or execution."""
+    algo = validate_sign_algo(algo)
+    subkey_algo = validate_subkey_algo(subkey_algo)
+    if algo in {"future-default", "default"}:
+        if subkey_algo != "default":
+            raise InputError(
+                "future-default/default primary requires subkey_algo='default'"
+            )
+    elif algo == "ed25519":
+        if subkey_algo != "cv25519":
+            raise InputError(
+                "ed25519 primary requires a cv25519 encryption subkey"
+            )
+    elif subkey_algo not in {"rsa3072", "rsa4096", "cv25519", "default"}:
+        raise InputError(
+            "RSA primary supports rsa3072, rsa4096, cv25519 or default subkeys"
+        )
+    return algo, subkey_algo
+
+
 def validate_ownertrust(value: str) -> str:
     level = (value or "").strip().lower()
     if level not in _OWNERTRUST:
@@ -398,10 +495,15 @@ def decode_payload(data: str | None, data_base64: str | None, *, limit: int) -> 
     if (data is None) == (data_base64 is None):
         raise InputError("provide exactly one of data or data_base64")
     if data is not None:
+        if len(data) > limit:
+            raise InputError(f"payload exceeds the {limit} byte limit")
         payload = data.encode("utf-8")
     else:
+        encoded = data_base64 or ""
+        if len(encoded) > (limit * 4 // 3) + 4:
+            raise InputError(f"payload exceeds the {limit} byte limit")
         try:
-            payload = base64.b64decode(data_base64 or "", validate=True)
+            payload = base64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError) as exc:
             raise InputError("data_base64 is not valid base64") from exc
     if len(payload) > limit:
@@ -470,8 +572,14 @@ def assert_recipient_allowed(policy: Policy, fingerprint: str) -> str:
     return fpr
 
 
+def _audit_failure(policy: Policy, message: str) -> None:
+    if policy.audit_required:
+        raise AuditError(f"audit log unavailable: {message}")
+    print(f"gpg-mcp: audit log unavailable: {message}", file=sys.stderr)
+
+
 def audit(policy: Policy, record: dict[str, Any]) -> None:
-    """Append one JSON line to the audit ledger. Best effort, never contains secrets."""
+    """Append one JSON line to the audit ledger. Never contains secrets."""
     entry = {
         "ts": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "home": str(policy.gnupg_home),
@@ -496,32 +604,22 @@ def audit(policy: Policy, record: dict[str, Any]) -> None:
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
-                print(
-                    "gpg-mcp: audit log is not a regular file; refusing to write",
-                    file=sys.stderr,
-                )
+                _audit_failure(policy, "not a regular file")
                 return
             if st.st_uid != os.getuid():
-                print(
-                    "gpg-mcp: audit log is not owned by the current user; "
-                    "refusing to write",
-                    file=sys.stderr,
-                )
+                _audit_failure(policy, "not owned by the current user")
                 return
             if stat.S_IMODE(st.st_mode) & 0o077:
                 try:
                     os.fchmod(fd, 0o600)
                 except OSError as exc:
-                    print(
-                        f"gpg-mcp: cannot tighten audit log permissions: {exc}",
-                        file=sys.stderr,
-                    )
+                    _audit_failure(policy, f"cannot tighten permissions: {exc}")
                     return
             os.write(fd, line.encode("utf-8"))
         finally:
             os.close(fd)
     except OSError as exc:  # pragma: no cover - depends on host
-        print(f"gpg-mcp: audit log unavailable: {exc}", file=sys.stderr)
+        _audit_failure(policy, str(exc))
 
 
 def assert_manage_key_allowed(policy: Policy, fingerprint: str) -> str:

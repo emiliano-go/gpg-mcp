@@ -39,6 +39,7 @@ from .errors import (
 )
 from .policy import (
     Policy,
+    assert_config_file,
     assert_decrypt_key_allowed,
     assert_keyring_permissions,
     assert_manage_key_allowed,
@@ -48,16 +49,16 @@ from .policy import (
     require_fingerprint,
     validate_expire,
     validate_hash_algo,
+    validate_key_algorithms,
     validate_ownertrust,
     validate_query,
-    validate_sign_algo,
     validate_subkey_algo,
     validate_uid,
 )
 
 MIN_GPG = (2, 2)
 _TMP = "{tmp}"
-_STATUS_LIMIT = 2 * 1024 * 1024
+_TOOL_OUTPUT_LIMIT = 1 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +94,16 @@ def _write_private(path: Path, data: bytes) -> None:
         os.write(fd, data)
     finally:
         os.close(fd)
+
+
+def read_status_file(path: Path, limit: int) -> str:
+    """Read a status file, failing closed if it exceeds the configured limit."""
+    size = path.stat().st_size
+    if size > limit:
+        raise OutputLimitError(
+            f"gpg status output exceeded the {limit} byte limit"
+        )
+    return path.read_bytes().decode("utf-8", errors="replace")
 
 
 def _kill_group(proc: asyncio.subprocess.Process) -> None:
@@ -217,14 +228,15 @@ def _hash_name(value: str | None) -> str:
 def _caps(value: str) -> dict[str, bool]:
     raw = value or ""
     own = raw.lower()
-    usable = raw.upper()
     return {
         "certify": "c" in own,
         "sign": "s" in own,
         "encrypt": "e" in own,
         "auth": "a" in own,
-        "usable_encrypt": "E" in usable,
-        "usable_sign": "S" in usable,
+        "usable_certify": "C" in raw,
+        "usable_sign": "S" in raw,
+        "usable_encrypt": "E" in raw,
+        "usable_auth": "A" in raw,
     }
 
 
@@ -355,7 +367,8 @@ def _verify_one(status: list[StatusEvent]) -> dict[str, Any]:
         elif kw == "NO_PUBKEY":
             out["missing_key"] = True
         elif kw.startswith("TRUST_"):
-            out["trust"] = kw.removeprefix("TRUST_").lower()
+            level = kw.removeprefix("TRUST_").lower()
+            out["trust"] = "full" if level == "fully" else level
         elif kw == "KEYEXPIRED":
             out["key_expired"] = True
         elif kw == "SIGEXPIRED":
@@ -450,6 +463,17 @@ def _verification(status: list[StatusEvent]) -> dict[str, Any]:
     return aggregate
 
 
+def import_result(result: GpgResult, summary: dict[str, Any]) -> dict[str, Any]:
+    """Classify an import as complete, partial or failed."""
+    if result.returncode == 0 and not summary["problems"]:
+        status = "complete"
+    elif summary["imported"]:
+        status = "partial"
+    else:
+        status = "failed"
+    return {**summary, "gpg_exit_code": result.returncode, "status": status}
+
+
 def _created_key(status: list[StatusEvent]) -> str | None:
     for ev in status:
         if ev.keyword == "KEY_CREATED" and len(ev.args) >= 2:
@@ -477,7 +501,24 @@ def clean_revocation_certificate(text: str) -> str:
 
 _ISSUER_FPR_RE = re.compile(r"issuer fpr v[0-9]+ ([0-9A-Fa-f]{40,64})")
 _REVOCATION_SIG_RE = re.compile(r"sigclass 0x20", re.IGNORECASE)
+_ANY_REVOCATION_SIG_RE = re.compile(r"sigclass 0x(?:20|28|30)", re.IGNORECASE)
 _KEYID_RE = re.compile(r"keyid ([0-9A-Fa-f]{16,32})")
+_PUBKEY_ENC_RE = re.compile(
+    r"^:pubkey enc packet:.*?keyid ([0-9A-Fa-f]{16,32})", re.MULTILINE
+)
+_SYMKEY_ENC_RE = re.compile(r"^:symkey enc packet:", re.MULTILINE)
+_ENCRYPTED_DATA_RE = re.compile(r"^:encrypted data packet:", re.MULTILINE)
+
+
+def parse_recipient_packets(packet_text: str) -> dict[str, Any]:
+    keyids = sorted({match.upper() for match in _PUBKEY_ENC_RE.findall(packet_text)})
+    symmetric = bool(_SYMKEY_ENC_RE.search(packet_text))
+    encrypted_data = bool(_ENCRYPTED_DATA_RE.search(packet_text))
+    return {
+        "public_key_ids": keyids,
+        "symmetric": symmetric,
+        "encrypted": encrypted_data or symmetric or bool(keyids),
+    }
 
 
 def revocation_packet_info(packet_text: str) -> dict[str, Any]:
@@ -488,6 +529,9 @@ def revocation_packet_info(packet_text: str) -> dict[str, Any]:
         },
         "keyids": keyids,
         "has_revocation_signature": bool(_REVOCATION_SIG_RE.search(packet_text)),
+        "has_any_revocation_signature": bool(
+            _ANY_REVOCATION_SIG_RE.search(packet_text)
+        ),
         "has_public_key": bool(
             re.search(r":public (?:sub )?key packet:", packet_text)
         ),
@@ -526,6 +570,23 @@ class Gpg:
         self._proc_all: bool | None = None
 
     # -- process plumbing ---------------------------------------------------
+
+    def _base_args(self) -> list[str]:
+        return [
+            self.gpg or "gpg",
+            "--batch",
+            "--no-tty",
+            "--no-options",
+            "--pinentry-mode",
+            "ask",
+            "--no-auto-check-trustdb",
+            "--no-auto-key-retrieve",
+            "--no-auto-key-import",
+            "--no-auto-key-locate",
+            "--no-encrypt-to",
+            "--no-comments",
+            "--no-emit-version",
+        ]
 
     async def _read_capped(
         self, stream: asyncio.StreamReader | None, limit: int
@@ -568,18 +629,7 @@ class Gpg:
                             raise InputError("internal temp file name is invalid")
                         _write_private(tmp / name, data)
                 status_path = tmp / "status"
-                argv = [
-                    self.gpg or "gpg",
-                    "--batch",
-                    "--no-tty",
-                    "--no-auto-check-trustdb",
-                    "--no-auto-key-retrieve",
-                    "--no-auto-key-import",
-                    "--no-auto-key-locate",
-                    "--no-encrypt-to",
-                    "--no-comments",
-                    "--no-emit-version",
-                ]
+                argv = self._base_args()
                 if use_status:
                     argv += ["--status-file", str(status_path)]
                 argv += [a.replace(_TMP, str(tmp)) for a in args]
@@ -638,8 +688,9 @@ class Gpg:
                 )
                 status_text = ""
                 if use_status and status_path.exists():
-                    raw = status_path.read_bytes()
-                    status_text = raw[:_STATUS_LIMIT].decode("utf-8", errors="replace")
+                    status_text = read_status_file(
+                        status_path, self.policy.max_status_bytes
+                    )
                 result = GpgResult(
                     argv=[redact(a) for a in argv],
                     returncode=returncode,
@@ -693,13 +744,30 @@ class Gpg:
             env=env,
             start_new_session=True,
         )
+        stdout_task = asyncio.create_task(
+            self._read_capped(proc.stdout, _TOOL_OUTPUT_LIMIT)
+        )
+        stderr_task = asyncio.create_task(
+            self._read_capped(proc.stderr, _TOOL_OUTPUT_LIMIT)
+        )
+        tasks = [stdout_task, stderr_task]
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout)
         except TimeoutError:
             _kill_group(proc)
             await proc.wait()
             raise TimeoutError_(f"{Path(binary).name} timed out") from None
-        return proc.returncode or 0, out, redact(err.decode("utf-8", errors="replace"))
+        except BaseException:
+            _kill_group(proc)
+            await proc.wait()
+            raise
+        finally:
+            for task in tasks:
+                task.cancel()
+        returncode = await proc.wait()
+        out = stdout_task.result() if stdout_task.done() else b""
+        err = stderr_task.result() if stderr_task.done() else b""
+        return returncode, out, redact(err.decode("utf-8", errors="replace"))
 
     async def _supports_proc_all_sigs(self) -> bool:
         if self._proc_all is None:
@@ -744,8 +812,19 @@ class Gpg:
             checks["keyring"] = {"ok": False, "path": str(self.home), "error": str(exc)}
         checks["gpg"] = {"path": self.gpg, "ok": bool(self.gpg)}
         checks["gpgconf"] = {"path": self.gpgconf, "ok": bool(self.gpgconf)}
-        checks["config"] = {"path": str(self.policy.config_path)}
+        try:
+            assert_config_file(self.policy.config_path)
+            checks["config"] = {"path": str(self.policy.config_path), "ok": True}
+        except Exception as exc:  # noqa: BLE001
+            checks["config"] = {
+                "path": str(self.policy.config_path),
+                "ok": False,
+                "error": str(exc),
+            }
         checks["approval"] = self.policy.approval
+        checks["destructive_confirmation"] = self.policy.destructive_confirmation
+        checks["allow_test_mode"] = self.policy.allow_test_mode
+        checks["audit_required"] = self.policy.audit_required
         checks["network"] = self.policy.enable_network
         checks["symmetric"] = self.policy.enable_symmetric
         checks["dedicated_home"] = self.policy.dedicated_home
@@ -841,13 +920,9 @@ class Gpg:
 
     async def inspect_recipients(self, ciphertext: bytes) -> dict[str, Any]:
         rc, text = await self._list_packets(ciphertext)
-        keyids = sorted({m.upper() for m in re.findall(r"keyid ([0-9A-Fa-f]{16,32})", text)})
-        symmetric = ":symkey enc packet:" in text
-        encrypted = ":encrypted data packet:" in text or symmetric or bool(keyids)
+        parsed = parse_recipient_packets(text)
         return {
-            "encrypted": encrypted,
-            "symmetric": symmetric,
-            "public_key_ids": keyids,
+            **parsed,
             "exit_code": rc,
         }
 
@@ -878,6 +953,9 @@ class Gpg:
             result = await self.run([*args, "--verify", "-"], input_data=data, check=False)
         info = _verification(result.status)
         info["gpg_exit_code"] = result.returncode
+        if result.returncode != 0:
+            info["policy_acceptable"] = False
+            info["valid"] = False
         info["mode"] = mode
         return info
 
@@ -1049,6 +1127,43 @@ class Gpg:
             raise PolicyError("no matching usable secret key is available for decryption")
         return keyids, wanted
 
+    def _check_decryption_key(
+        self,
+        status: list[StatusEvent],
+        wanted: list[str],
+        preflight: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        allowed = {fpr.upper() for fpr in wanted}
+        used = [
+            event
+            for event in status
+            if event.keyword == "DECRYPTION_KEY" and len(event.args) >= 2
+        ]
+        if not used:
+            if preflight["public_key_ids"] and not preflight["symmetric"]:
+                raise GpgMcpError(
+                    "gpg did not report which key performed decryption",
+                    code="decryption_key_unknown",
+                )
+            return []
+        actual: list[dict[str, Any]] = []
+        for event in used:
+            fingerprint = event.args[0].upper()
+            primary = event.args[1].upper()
+            if fingerprint not in allowed and primary not in allowed:
+                raise PolicyError(
+                    "decryption used a key outside the allow-list: "
+                    f"{primary} ({fingerprint})"
+                )
+            actual.append(
+                {
+                    "fingerprint": fingerprint,
+                    "primary_fingerprint": primary,
+                    "ownertrust": event.args[2] if len(event.args) > 2 else None,
+                }
+            )
+        return actual
+
     async def decrypt(
         self,
         ciphertext: bytes,
@@ -1099,6 +1214,7 @@ class Gpg:
             raise self._execution_error(result)
         if result.returncode != 0 and not any(ev.keyword == "DECRYPTION_OKAY" for ev in status):
             raise self._execution_error(result)
+        actual_keys = self._check_decryption_key(status, wanted, preflight)
         sig = _verification(status)
         has_signature = sig["status"] not in {"UNKNOWN", None}
         if verify and has_signature and not sig["valid"]:
@@ -1109,7 +1225,11 @@ class Gpg:
             )
         payload: dict[str, Any] = {
             "plaintext": encode_payload(result.stdout),
-            "decryption_keys": wanted,
+            "decryption_keys": [
+                item["primary_fingerprint"] for item in actual_keys
+            ],
+            "allowed_keys": wanted,
+            "actual_keys": actual_keys,
             "recipients": visible,
             "extra_recipients": extra,
             "signed": has_signature,
@@ -1135,7 +1255,9 @@ class Gpg:
         result = await self.run(args, input_data=data)
         return {"armor": armor, "ciphertext": encode_payload(result.stdout)}
 
-    async def symmetric_decrypt(self, ciphertext: bytes) -> dict[str, Any]:
+    async def symmetric_decrypt(
+        self, ciphertext: bytes, *, verify: bool = True
+    ) -> dict[str, Any]:
         self._require_symmetric()
         preflight = await self.inspect_recipients(ciphertext)
         if not preflight["symmetric"]:
@@ -1149,24 +1271,64 @@ class Gpg:
             ev.keyword == "DECRYPTION_OKAY" for ev in result.status
         ):
             raise self._execution_error(result)
-        return {"plaintext": encode_payload(result.stdout)}
+        sig = _verification(result.status)
+        has_signature = sig["status"] not in {"UNKNOWN", None}
+        if verify and has_signature and not sig["valid"]:
+            raise GpgMcpError(
+                "refusing to return plaintext with an invalid embedded signature",
+                code="bad_signature",
+                data={"signature": sig},
+            )
+        return {
+            "plaintext": encode_payload(result.stdout),
+            "signed": has_signature,
+            "signature": sig if has_signature else None,
+        }
 
     # -- import -------------------------------------------------------------
 
-    async def import_public_key(self, key_data: bytes, *, allow_secret: bool = False) -> dict[str, Any]:
+    async def inspect_import_keys(self, key_data: bytes) -> dict[str, Any]:
+        """Validate public-key material and return the identities it carries.
+
+        Secret-key packets and any revocation signature are rejected. Full key
+        revocations must use the dedicated import_revocation path.
+        """
         if contains_secret_material(key_data.decode("utf-8", errors="ignore")):
             raise PolicyError("secret key material is never imported through gpg-mcp")
         _, packet_text = await self._list_packets(key_data)
-        if re.search(r":secret (?:sub )?key packet:", packet_text) and not (
-            allow_secret and self.policy.allow_secret_import
-        ):
+        if re.search(r":secret (?:sub )?key packet:", packet_text):
             raise PolicyError("secret key material is never imported through gpg-mcp")
+        info = revocation_packet_info(packet_text)
+        if info["has_any_revocation_signature"]:
+            raise PolicyError(
+                "revocation signatures must be imported with import_revocation"
+            )
+        show = await self.run(
+            ["--show-keys", "--with-colons"],
+            input_data=key_data,
+            check=False,
+            use_status=False,
+        )
+        keys = parse_colon_keys(show.text)
+        if not keys:
+            raise GpgMcpError(
+                "input does not contain a usable public key", code="invalid_key"
+            )
+        return {
+            "keys": keys,
+            "fingerprints": [
+                key["fingerprint"] for key in keys if key.get("fingerprint")
+            ],
+        }
+
+    async def import_public_key(self, key_data: bytes) -> dict[str, Any]:
+        await self.inspect_import_keys(key_data)
         result = await self.run(["--import"], input_data=key_data, check=False)
         summary = _import_summary(result.status)
-        if not summary["imported"] and result.returncode != 0:
+        outcome = import_result(result, summary)
+        if outcome["status"] == "failed":
             raise self._execution_error(result)
-        summary["gpg_exit_code"] = result.returncode
-        return summary
+        return outcome
 
     # -- key management -----------------------------------------------------
 
@@ -1187,7 +1349,7 @@ class Gpg:
                 "Key-Curve: ed25519",
                 "Key-Usage: cert,sign",
                 "Subkey-Type: ecdh",
-                f"Subkey-Curve: {subkey_algo}",
+                "Subkey-Curve: cv25519",
                 "Subkey-Usage: encrypt",
             ]
         else:
@@ -1196,10 +1358,22 @@ class Gpg:
                 "Key-Type: RSA",
                 f"Key-Length: {bits}",
                 "Key-Usage: cert,sign",
-                "Subkey-Type: RSA",
-                f"Subkey-Length: {bits}",
-                "Subkey-Usage: encrypt",
             ]
+            if subkey_algo == "cv25519":
+                lines += [
+                    "Subkey-Type: ecdh",
+                    "Subkey-Curve: cv25519",
+                    "Subkey-Usage: encrypt",
+                ]
+            else:
+                sub_bits = (
+                    bits if subkey_algo == "default" else subkey_algo.removeprefix("rsa")
+                )
+                lines += [
+                    "Subkey-Type: RSA",
+                    f"Subkey-Length: {sub_bits}",
+                    "Subkey-Usage: encrypt",
+                ]
         match = re.match(r"^\s*(.*?)\s*<([^<>\s]+@[^<>\s]+)>\s*$", uid)
         if match:
             name = match.group(1).strip() or match.group(2)
@@ -1222,14 +1396,18 @@ class Gpg:
         subkey_algo: str = "cv25519",
     ) -> dict[str, Any]:
         uid = validate_uid(uid)
-        algo = validate_sign_algo(algo)
+        algo, subkey_algo = validate_key_algorithms(algo, subkey_algo)
         expire = validate_expire(expire)
-        subkey_algo = validate_subkey_algo(subkey_algo)
         if not protect and not self.policy.allow_unprotected_keys:
             raise PolicyError(
                 "unprotected keys are disabled; set allow_unprotected_keys=true only "
                 "for disposable test keyrings"
             )
+        before = {
+            key["fingerprint"]
+            for key in await self.list_keys(secret=True)
+            if key.get("fingerprint")
+        }
         params = self._key_params(uid, algo, expire, protect, subkey_algo)
         result = await self.run(
             ["--generate-key", f"{_TMP}/keyparams"],
@@ -1238,18 +1416,30 @@ class Gpg:
         )
         fpr = _created_key(result.status)
         if not fpr:
-            keys = await self.list_keys(secret=True)
-            candidate = next((k for k in keys if any(uid in u["uid"] for u in k["uids"])), None)
-            fpr = candidate["fingerprint"] if candidate else None
-        if not fpr:
-            raise GpgMcpError("key was generated but its fingerprint could not be determined")
+            after = await self.list_keys(secret=True)
+            new = [
+                key["fingerprint"]
+                for key in after
+                if key.get("fingerprint") and key["fingerprint"] not in before
+            ]
+            if len(new) != 1:
+                raise GpgMcpError(
+                    "key was generated but its fingerprint could not be determined"
+                )
+            fpr = new[0]
+        key = await self.get_key(fpr)
         return {
             "fingerprint": fpr,
             "uid": uid,
             "algorithm": algo,
             "expire": expire,
             "protected": protect,
-            "key": await self.get_key(fpr),
+            "requested_subkey_algo": subkey_algo,
+            "generated": {
+                "primary": key["algorithm"],
+                "subkeys": [subkey["algorithm"] for subkey in key["subkeys"]],
+            },
+            "key": key,
         }
 
     async def add_subkey(
@@ -1465,6 +1655,7 @@ class Gpg:
             return {
                 "applied": False,
                 "would_revoke": True,
+                "status": "validated",
                 "fingerprint": fpr,
                 "uid": validated["uid"],
                 "uids": validated["uids"],
@@ -1488,6 +1679,8 @@ class Gpg:
             "uid": validated["uid"],
             "uids": validated["uids"],
             **summary,
+            "status": "complete",
+            "gpg_exit_code": result.returncode,
             "imported": True,
             "revocation_imported": True,
         }
@@ -1537,9 +1730,10 @@ class Gpg:
             timeout=self.policy.timeout_s,
         )
         summary = _import_summary(result.status)
-        if result.returncode != 0 and not summary["imported"]:
+        outcome = import_result(result, summary)
+        if outcome["status"] == "failed":
             raise self._execution_error(result)
-        return {"keyserver": self.policy.keyserver, **summary}
+        return {"keyserver": self.policy.keyserver, **outcome}
 
     async def send_key(self, fingerprint: str) -> dict[str, Any]:
         self._require_network()

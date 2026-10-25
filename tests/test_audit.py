@@ -5,18 +5,21 @@ import stat
 
 import pytest
 
+from gpg_mcp.errors import AuditError
 from gpg_mcp.policy import audit, load_policy, reset_policy_cache
 from gpg_mcp.server import reset_gpg
 
 
-def _policy(tmp_path, audit_log: str):
+def _policy(tmp_path, audit_log: str, *, audit_required: bool = True):
     config = tmp_path / "config.toml"
     config.write_text(
         f'gnupg_home = "{tmp_path / "home"}"\n'
         f'audit_log = "{audit_log}"\n'
-        'approval = "none"\n',
+        'approval = "none"\n'
+        f'audit_required = {str(audit_required).lower()}\n',
         encoding="utf-8",
     )
+    os.chmod(config, 0o600)
     reset_policy_cache()
     return load_policy(config, env={})
 
@@ -54,6 +57,7 @@ async def test_audit_contains_no_payload_preview(monkeypatch, tmp_path, keyring,
         "allow_unprotected_keys = true\n",
         encoding="utf-8",
     )
+    os.chmod(config, 0o600)
     monkeypatch.setenv("GPG_MCP_CONFIG", str(config))
     reset_policy_cache()
     reset_gpg()
@@ -93,7 +97,7 @@ def test_audit_refuses_symlink(tmp_path) -> None:
     target.write_text("keep", encoding="utf-8")
     link = tmp_path / "audit.jsonl"
     link.symlink_to(target)
-    policy = _policy(tmp_path, str(link))
+    policy = _policy(tmp_path, str(link), audit_required=False)
     audit(policy, {"event": "test"})
     assert target.read_text(encoding="utf-8") == "keep"
     reset_policy_cache()
@@ -104,7 +108,18 @@ def test_audit_refuses_fifo_without_blocking(tmp_path) -> None:
     parent.mkdir()
     fifo = parent / "audit.jsonl"
     os.mkfifo(fifo)
-    policy = _policy(tmp_path, str(fifo))
+    policy = _policy(tmp_path, str(fifo), audit_required=False)
     audit(policy, {"event": "test"})
     assert fifo.exists()
+    reset_policy_cache()
+
+
+def test_audit_required_raises_on_unsafe_file(tmp_path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("keep", encoding="utf-8")
+    link = tmp_path / "audit.jsonl"
+    link.symlink_to(target)
+    policy = _policy(tmp_path, str(link), audit_required=True)
+    with pytest.raises(AuditError):
+        audit(policy, {"event": "test"})
     reset_policy_cache()

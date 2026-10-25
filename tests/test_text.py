@@ -64,6 +64,7 @@ def approval_env(monkeypatch, keyring):
         "allow_unprotected_keys = true\n",
         encoding="utf-8",
     )
+    os.chmod(path, 0o600)
     monkeypatch.setenv("GPG_MCP_CONFIG", str(path))
     reset_policy_cache()
     reset_gpg()

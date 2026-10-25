@@ -38,8 +38,8 @@ from .policy import (
     require_fingerprint,
     validate_expire,
     validate_hash_algo,
+    validate_key_algorithms,
     validate_ownertrust,
-    validate_sign_algo,
     validate_subkey_algo,
     validate_uid,
 )
@@ -244,9 +244,8 @@ async def _ask_create_key(
 ) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
     uid = validate_uid(uid)
-    algo = validate_sign_algo(algo)
+    algo, subkey_algo = validate_key_algorithms(algo, subkey_algo)
     expire = validate_expire(expire)
-    subkey_algo = validate_subkey_algo(subkey_algo)
     warning = "" if protect else "\nWARNING: the new key will have NO passphrase."
     return await request(
         "create_key",
@@ -309,17 +308,27 @@ async def _ask_change_passphrase(fingerprint: str = "", ctx: Context | None = No
 
 
 async def _ask_import_public_key(
-    key: str | None = None, key_base64: str | None = None, allow_secret: bool = False,
+    key: str | None = None,
+    key_base64: str | None = None,
     ctx: Context | None = None,
 ) -> Confirm | Elicit[Confirm]:
     set_approval_context(ctx)
     payload = _decode(key, key_base64)
+    inspected = await gpg().inspect_import_keys(payload)
+    lines = []
+    for item in inspected["keys"]:
+        uids = "; ".join(
+            single_line(uid["uid"], limit=120) for uid in item["uids"][:3]
+        )
+        lines.append(
+            f"- {item['fingerprint']}" + (f" ({uids})" if uids else "")
+        )
     return await request(
         "import_public_key",
         payload_summary(
             "import an OpenPGP key",
             payload,
-            extra=f"Secret import requested: {allow_secret}",
+            extra="Keys to import:\n" + "\n".join(lines),
         ),
     )
 
@@ -622,6 +631,7 @@ async def decrypt(
     _audit(
         "decrypt",
         expected_key=expected_key,
+        actual_keys=result.get("actual_keys", []),
         ciphertext_sha256=_hash(payload),
         size=len(payload),
         signed=result["signed"],
@@ -651,6 +661,7 @@ async def symmetric_encrypt(
 async def symmetric_decrypt(
     ciphertext: str | None = None,
     ciphertext_base64: str | None = None,
+    verify: bool = True,
     approval: Annotated[ElicitationResult[Confirm], Resolve(_ask_symmetric_decrypt)] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Decrypt a symmetric message with a passphrase entered only into pinentry."""
@@ -658,7 +669,7 @@ async def symmetric_decrypt(
     decision = evaluate(approval)
     record_decision("symmetric_decrypt", decision)
     require_approved(decision, "symmetric_decrypt")
-    result = await gpg().symmetric_decrypt(payload)
+    result = await gpg().symmetric_decrypt(payload, verify=verify)
     _audit(
         "symmetric_decrypt", ciphertext_sha256=_hash(payload), size=len(payload), result="ok"
     )
@@ -759,20 +770,19 @@ async def change_passphrase(
 async def import_public_key(
     key: str | None = None,
     key_base64: str | None = None,
-    allow_secret: bool = False,
     approval: Annotated[ElicitationResult[Confirm], Resolve(_ask_import_public_key)] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Import public key material. Secret key material is rejected."""
+    """Import public key material. Secret and revocation material is rejected."""
     payload = _decode(key, key_base64)
     decision = evaluate(approval)
     record_decision("import_public_key", decision)
     require_approved(decision, "import_public_key")
-    result = await gpg().import_public_key(payload, allow_secret=allow_secret)
+    result = await gpg().import_public_key(payload)
     _audit(
         "import_public_key",
         imported=result["imported_fingerprints"],
         payload_sha256=_hash(payload),
-        result="ok",
+        result=result["status"],
     )
     return result
 
@@ -894,7 +904,7 @@ async def fetch_key(
         fingerprint=fpr,
         imported=result["imported_fingerprints"],
         keyserver=get_policy().keyserver,
-        result="ok",
+        result=result["status"],
     )
     return result
 
