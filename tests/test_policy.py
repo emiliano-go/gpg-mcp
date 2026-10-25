@@ -357,3 +357,17 @@ def test_init_refuses_agent_conf_symlink(tmp_path) -> None:
         cmd_init(argparse.Namespace(home=str(home), config=str(config)))
     assert target.read_text(encoding="utf-8") == "keep"
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+def test_init_dangling_config_symlink_does_not_create_target(tmp_path) -> None:
+    import argparse
+
+    from gpg_mcp.__main__ import cmd_init
+
+    home = tmp_path / "gnupg"
+    target = tmp_path / "missing-config.toml"
+    config = tmp_path / "config.toml"
+    config.symlink_to(target)
+    with pytest.raises(PolicyError):
+        cmd_init(argparse.Namespace(home=str(home), config=str(config)))
+    assert not target.exists()

@@ -16,9 +16,9 @@ from .policy import (
     DEFAULT_CONFIG,
     DEFAULT_GNUPG_HOME,
     assert_config_file,
-    assert_config_parent,
     assert_keyring_permissions,
     assert_production_policy,
+    assert_secure_ancestors,
     get_policy,
     load_policy,
 )
@@ -94,18 +94,26 @@ def cmd_init(args: argparse.Namespace) -> int:
     if not config.parent.exists():
         config.parent.mkdir(parents=True, mode=0o700)
         os.chmod(config.parent, 0o700)
-    if not config.exists():
-        config.write_text(DEFAULT_CONFIG_TEXT.format(home=home), encoding="utf-8")
-    st = config.lstat()
-    if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid():
-        os.chmod(config, 0o600)
-    else:
-        print(
-            "gpg-mcp: config is not a regular file owned by the current user; "
-            "not changing its permissions",
-            file=sys.stderr,
+    assert_secure_ancestors(config.parent)
+    try:
+        config_st = config.lstat()
+    except FileNotFoundError:
+        fd = os.open(
+            config,
+            os.O_CREAT
+            | os.O_EXCL
+            | os.O_WRONLY
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
         )
-    assert_config_parent(config)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(DEFAULT_CONFIG_TEXT.format(home=home))
+    else:
+        if not stat.S_ISREG(config_st.st_mode) or config_st.st_uid != os.getuid():
+            raise PolicyError(
+                "config must be a regular file owned by the current user"
+            )
+        os.chmod(config, 0o600)
     assert_config_file(config)
     print(f"keyring: {home}")
     print(f"config:  {config}")

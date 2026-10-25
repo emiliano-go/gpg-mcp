@@ -92,15 +92,20 @@ fixed, typed surface with deliberate omissions:
     root and must not be group/world writable without the sticky bit. Unknown keys are rejected.
     Existing audit files are `fstat`ed, non-regular/foreign-owned files are refused, and group/other
     access is tightened to `0600`. With `audit_required = true`, an audit failure fails the
-    operation. `init` refuses a symlinked `gpg-agent.conf` instead of chmodding its target.
+    operation. `init` securely creates the config with `O_EXCL|O_NOFOLLOW` and refuses a symlinked
+    `gpg-agent.conf` instead of writing through or chmodding its target. The audit path uses the same
+    directory-fd walk, so an unsafe ancestor cannot redirect the ledger.
 18. **Decryption routing is unambiguous.** `symmetric_decrypt` rejects hybrid ciphertext that also
     carries public-key recipients. `decrypt` rejects symmetric-only ciphertext and refuses to return
     plaintext unless GnuPG reports an actual allow-listed public key; it never falls back to the
     symmetric route. A custom policy that gates only `symmetric_decrypt` therefore cannot be bypassed
-    through `decrypt`.
-19. **Multi-signature enumeration is complete.** On GnuPG versions without `--proc-all-sigs`, the
-    verifier splits detached signatures and verifies each packet independently, then aggregates
-    fail-closed across all of them.
+    through `decrypt`. For hybrid input, only GnuPG's recoverable symmetric-passphrase failure is
+    tolerated, and only when a public key also reported `DECRYPTION_KEY` and `DECRYPTION_OKAY`;
+    generic `ERROR`/`FAILURE` events and unexplained nonzero exit codes are rejected.
+19. **Multi-signature handling is fail-closed.** Detached signatures use a per-packet fallback on
+    GnuPG versions without `--proc-all-sigs`. Cleartext, inline, and embedded signatures use
+    `--proc-all-sigs` when supported. On older GnuPG a bad-first message may stop enumeration at
+    the first bad signature, but it is still rejected; all-good messages enumerate every signature.
 
 ### Verification result semantics
 
@@ -500,7 +505,10 @@ operations. It asserts, among other things, that:
 - symmetric-only input is rejected by `decrypt` while hybrid input succeeds through an allow-listed public key;
 - a custom policy that gates only `symmetric_decrypt` cannot be bypassed through `decrypt`;
 - config ancestors are walked securely and non-sticky writable ancestors are rejected;
-- `init` refuses a symlinked `gpg-agent.conf`;
+- `init` refuses a symlinked `gpg-agent.conf` and a dangling config symlink cannot create its target;
+- the audit path rejects non-sticky writable ancestors;
+- multi-signature cleartext, inline, and embedded messages enumerate and aggregate correctly;
+- hybrid decryption tolerates only the recoverable symmetric-passphrase failure pattern;
 - multiple signatures are enumerated and fail closed both with and without `--proc-all-sigs`;
 - hybrid symmetric/public-key ciphertext is rejected by `symmetric_decrypt`;
 - audit short writes, intent/outcome phases, and outcome failures are handled;

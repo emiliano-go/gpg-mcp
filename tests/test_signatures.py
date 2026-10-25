@@ -297,3 +297,58 @@ async def test_multiple_signatures_individual_fallback(connect, keyring, monkeyp
         assert result["signature_count"] == 2
         assert result["valid"] is False
         assert result["status"] == "BADSIG"
+
+
+@pytest.mark.asyncio
+async def test_multiple_signatures_cleartext_and_inline(connect, keyring) -> None:
+    cleartext = _gpg(
+        keyring,
+        "--clearsign",
+        "--local-user",
+        keyring.fpr,
+        "--local-user",
+        keyring.fpr2,
+        input_data=b"multi clear",
+    ).decode("utf-8")
+    inline = _gpg(
+        keyring,
+        "--sign",
+        "--armor",
+        "--local-user",
+        keyring.fpr,
+        "--local-user",
+        keyring.fpr2,
+        input_data=b"multi inline",
+    ).decode("utf-8")
+
+    async with connect() as client:
+        for payload, mode in ((cleartext, "cleartext"), (inline, "inline")):
+            result = ok(
+                await call(client, "verify", data=payload, mode=mode)
+            )
+            assert result["signature_count"] == 2
+            assert result["valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_multiple_embedded_signatures_in_encrypted_message(connect, keyring) -> None:
+    encrypted = _gpg(
+        keyring,
+        "--sign",
+        "--local-user",
+        keyring.fpr,
+        "--local-user",
+        keyring.fpr2,
+        "--encrypt",
+        "--recipient",
+        keyring.fpr,
+        input_data=b"multi encrypted",
+    )
+    encoded = base64.b64encode(encrypted).decode("ascii")
+    async with connect() as client:
+        result = ok(
+            await call(client, "decrypt", ciphertext_base64=encoded)
+        )
+        assert result["plaintext"] == {"text": "multi encrypted"}
+        assert result["signature"]["signature_count"] == 2
+        assert result["signature"]["valid"] is True

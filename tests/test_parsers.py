@@ -292,3 +292,33 @@ def test_import_result_states() -> None:
 
     failed = GpgResult(argv=[], returncode=2, stdout=b"", stderr="", status=[])
     assert import_result(failed, _import_summary(failed.status))["status"] == "failed"
+
+
+def test_decryption_status_accepts_only_clean_public_key_results() -> None:
+    from gpg_mcp.gpg import StatusEvent, decryption_status_ok
+
+    def events(*items):
+        return [StatusEvent(keyword, args, "") for keyword, args in items]
+
+    symkey = events(
+        ("ERROR", ["get_passphrase", "85"]),
+        ("DECRYPTION_KEY", ["A" * 40, "A" * 40, "u"]),
+        ("DECRYPTION_OKAY", []),
+        ("FAILURE", ["gpg-exit"]),
+    )
+    assert decryption_status_ok(symkey, 2, hybrid=True) is True
+    assert decryption_status_ok(symkey, 2, hybrid=False) is False
+    assert decryption_status_ok(events(("DECRYPTION_OKAY", [])), 0) is True
+    assert decryption_status_ok(events(("DECRYPTION_OKAY", [])), 2) is False
+    assert decryption_status_ok(
+        events(("DECRYPTION_OKAY", []), ("ERROR", ["other.error"])), 0
+    ) is False
+    assert decryption_status_ok(
+        events(("DECRYPTION_OKAY", []), ("FAILURE", ["x"])), 0
+    ) is False
+    assert decryption_status_ok(
+        events(("DECRYPTION_FAILED", []), ("DECRYPTION_OKAY", [])), 0
+    ) is False
+    assert decryption_status_ok(
+        events(("DECRYPTION_OKAY", []), ("BADMDC", [])), 0
+    ) is False
